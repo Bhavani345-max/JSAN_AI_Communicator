@@ -1,0 +1,17 @@
+{
+  "name": "@jsan/database",
+  "version": "5.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SQLite store for the JSAN Dev AI portal",
+  "exports": {
+    ".": "./src/sqlite.js",
+    "./schema.sql": "./src/schema.sql"
+  },
+  "scripts": {
+    "init": "node src/cli.js init",
+    "status": "node src/cli.js status",
+    "verify": "node src/verify.js",
+    "reset": "node src/cli.js reset"
+  }
+}

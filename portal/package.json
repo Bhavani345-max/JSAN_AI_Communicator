@@ -1,0 +1,17 @@
+{
+  "name": "jsan-dev-ai",
+  "version": "5.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "npm --prefix backend start",
+    "build:frontend": "npm --prefix frontend install && npm --prefix frontend run build",
+    "check:frontend": "npm --prefix frontend install && npm --prefix frontend run typecheck",
+    "check:backend": "npm --prefix backend install && npm --prefix backend run check",
+    "db:init": "node database/src/cli.js init",
+    "db:status": "node database/src/cli.js status",
+    "db:verify": "node database/src/verify.js",
+    "db:reset": "node database/src/cli.js reset"
+  }
+}

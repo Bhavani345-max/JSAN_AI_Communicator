@@ -1,0 +1,36 @@
+# Production go-live checklist
+
+- [ ] Railway Pro workspace/project selected
+- [ ] Production environment isolated from staging
+- [ ] Postgres provisioned (LiteLLM only)
+- [ ] Daily database backup enabled
+- [ ] PITR decision documented
+- [ ] Portal volume attached and mounted at /data
+- [ ] SQLITE_PATH points at the volume
+- [ ] Portal volume backup/copy routine agreed
+- [ ] Portal replica count pinned to 1 (SQLite single writer **and** the in-process concurrency guard both depend on it)
+- [ ] LiteLLM has no permanent public domain
+- [ ] Portal has `ai.jsanconsulting.com`
+- [ ] Railway TLS active
+- [ ] Strong registration access code
+- [ ] Strong JWT secret
+- [ ] Strong key-encryption secret
+- [ ] LiteLLM master key generated
+- [ ] LiteLLM salt key generated and archived securely
+- [ ] No secrets committed to Git
+- [ ] Portal healthcheck passes
+- [ ] LiteLLM readiness healthcheck passes
+- [ ] `auto`, `code`, `think`, `fast` tested
+- [ ] `see` tested with a screenshot
+- [ ] PDF to PPTX conversion tested
+- [ ] `/v1/models` works with developer virtual key
+- [ ] Codex tested
+- [ ] Claude Code tested
+- [ ] `MAX_CONCURRENT_REQUESTS_PER_USER` set on the portal service
+- [ ] Concurrency guard verified refusing the third simultaneous call (section 9)
+- [ ] 20-user cap tested
+- [ ] Key rotation tested
+- [ ] Railway spend alerts configured
+- [ ] Resource/replica limits reviewed
+- [ ] Provider billing/quota alerts configured
+- [ ] Recovery owner and rollback process assigned

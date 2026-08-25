@@ -1,0 +1,50 @@
+# Local development only.
+#
+# Production runs on Railway (see RAILWAY_DEPLOYMENT_GUIDE.md), where Postgres
+# and LiteLLM are managed services on the private network and none of this
+# file applies.
+#
+# Postgres is here for LiteLLM alone. The portal keeps its own state in SQLite
+# at portal/database/data/jsan.db and needs nothing from this file.
+#
+# The portal is deliberately NOT a service here - run it on the host with
+# `npm start` from portal/backend so restarts stay instant.
+#
+#   docker compose -f docker-compose.local.yml up -d
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: litellm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d litellm"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    env_file: litellm/.env
+    environment:
+      # Overrides the value in litellm/.env, which is written for running
+      # LiteLLM on the host. Inside this network the database answers to
+      # `postgres`, not localhost.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

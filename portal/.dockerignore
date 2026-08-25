@@ -1,0 +1,13 @@
+# node_modules matters most here: the backend's @jsan/database entry is a link
+# created by npm install, and copying a host-built one into the image leaves it
+# dangling. The image installs its own.
+**/node_modules
+
+# Built by the frontend stage inside the image.
+**/dist
+
+# Local SQLite files and secrets never belong in an image. On Railway the
+# platform injects the environment directly.
+**/data
+**/.env
+*.log

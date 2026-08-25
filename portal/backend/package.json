@@ -1,0 +1,20 @@
+{
+  "name": "jsan-dev-ai-api",
+  "version": "5.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "dependencies": {
+    "@jsan/database": "file:../database",
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "jsonwebtoken": "^9.0.2",
+    "pdfjs-dist": "^6.2.108",
+    "pptxgenjs": "^4.0.1"
+  }
+}

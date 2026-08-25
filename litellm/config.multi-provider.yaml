@@ -1,0 +1,281 @@
+# Model routing with direct free-tier providers. NOT THE ACTIVE CONFIG.
+#
+# The live gateway runs config.yaml, which routes every mode through OpenRouter.
+# This file is that roster rewritten onto direct provider accounts, with
+# OpenRouter kept underneath as the fallback. It is deliberately not wired into
+# docker-compose.local.yml or litellm/Dockerfile: activating it needs provider
+# credentials that do not exist in this project yet.
+#
+#
+# DO NOT DEPLOY THIS UNTIL THE CREDENTIALS EXIST
+# ---------------------------------------------------------------------------
+# A deployment whose api_key resolves to an unset environment variable does not
+# fail politely. Measured against litellm:main-stable on 2026-08-21, with one
+# credential-less entry beside one healthy entry in the same model group, six
+# identical requests returned five 200s and one 500: LiteLLM raises
+# AuthenticationError, which it treats as non-retryable and surfaces to the
+# caller instead of routing past. Adding these entries without their keys would
+# take a gateway that currently answers every request and give it an
+# intermittent hard-failure rate.
+#
+# So: set the key for a provider, or delete that provider's entries. Do not
+# deploy this file with placeholders in it.
+#
+#
+# WHAT IS VERIFIED HERE AND WHAT IS NOT
+# ---------------------------------------------------------------------------
+# Model IDs, context windows, output ceilings and published free-tier quotas
+# below were read from provider documentation on 2026-08-21 and are cited
+# inline. None of it has been exercised against a live account, because this
+# project holds no Cerebras, Groq, NVIDIA or Gemini credential. Every route in
+# this file is therefore UNTESTED. Confirm each one answers before putting a
+# team on it.
+#
+# The per-deployment `rpm` and `tpm` values are the provider's published
+# free-tier ceilings, so the router stops sending to a deployment before the
+# provider starts refusing it. They are account quotas, not model limits, and
+# they are shared across everyone using that account - twenty developers draw
+# from one pool. Where a provider does not publish a number, the field is
+# omitted rather than guessed at: an invented quota is worse than none, because
+# the router would believe it.
+#
+#
+# OUTPUT LIMITS ARE UNCHANGED
+# ---------------------------------------------------------------------------
+# max_tokens per mode is carried over from config.yaml exactly - auto 16000,
+# code 16000, think 20000, fast 12000 - and every model chosen below accepts
+# them. Groq's gpt-oss-120b tops out at 65,536 output tokens and Cerebras runs
+# a 65k free-tier context, so the ceilings fit the models.
+#
+# They do not fit Groq's free-tier *token* quota, which is the one real
+# compatibility problem found. See the note on the `code` group.
+
+model_list:
+
+  # ---------------------------------------------------------------- auto ----
+  # Everyday work. Cerebras and Groq share this group; OpenRouter sits under
+  # both as the entry that answers when neither does.
+  #
+  # weight is how strict ordering is expressed inside a single model group.
+  # Separate groups chained with `fallbacks` would order the providers exactly,
+  # but developer virtual keys are scoped to the five public model names at
+  # issue time (KEY_MODELS in portal/backend/src/server.js), and whether a
+  # fallback onto an unscoped group name passes that check is not something
+  # this project has been able to test. Weighting inside the existing names
+  # cannot hit that problem at all: preference is probabilistic rather than
+  # absolute, and a provider that starts failing is taken out by cooldown.
+  - model_name: auto
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY
+      max_tokens: 16000
+      weight: 4
+      # Cerebras free trial, per inference-docs.cerebras.ai/support/rate-limits
+      rpm: 5
+      tpm: 30000
+  - model_name: auto
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      max_tokens: 16000
+      weight: 4
+      # Groq free plan, per console.groq.com/docs/rate-limits
+      rpm: 30
+      tpm: 8000
+  - model_name: auto
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 16000
+      weight: 1
+
+  # ---------------------------------------------------------------- code ----
+  # Implementation, debugging, review. Cerebras preferred, Groq behind it,
+  # OpenRouter underneath.
+  #
+  # COMPATIBILITY PROBLEM, unresolved and needing a decision rather than a
+  # config change: Groq's free plan allows 8,000 tokens per minute across the
+  # whole account, and this mode is allowed 16,000 output tokens for one
+  # answer. A single full-length code answer cannot fit in a minute of Groq
+  # free-tier quota. A measured answer of this kind - "explain a production
+  # React auth architecture in 800+ words" - cost 1,547 completion tokens, so
+  # roughly four such turns per minute exhaust the account for everyone.
+  #
+  # The instruction for this work was to leave the output ceilings alone, and
+  # they are left alone: 16000 stands. What that means in practice is that Groq
+  # free cannot be the primary for `code` at twenty seats. Either `code` runs
+  # on a paid Groq tier, or Cerebras carries it, or it stays on OpenRouter.
+  - model_name: code
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY
+      max_tokens: 16000
+      weight: 8
+      rpm: 5
+      tpm: 30000
+  - model_name: code
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      max_tokens: 16000
+      weight: 2
+      rpm: 30
+      tpm: 8000
+  - model_name: code
+    litellm_params:
+      model: openrouter/poolside/laguna-s-2.1:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 16000
+      weight: 1
+
+  # --------------------------------------------------------------- think ----
+  # Architecture and deeper reasoning.
+  #
+  # CAPABILITY REGRESSION, stated rather than hidden: the OpenRouter entry is a
+  # 550B reasoning model with a 1M context window. gpt-oss-120b reasons - Groq
+  # lists Reasoning among its capabilities - but its context is 131,072 on Groq
+  # and 65k on the Cerebras free tier. Moving `think` onto a direct provider
+  # therefore cuts the window this mode can hold by more than an order of
+  # magnitude. For a mode whose whole purpose is reasoning over a large body of
+  # code, that is a real loss, and it is why OpenRouter keeps a higher weight
+  # here than in the other groups.
+  - model_name: think
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY
+      max_tokens: 20000
+      weight: 4
+      rpm: 5
+      tpm: 30000
+  - model_name: think
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 20000
+      weight: 3
+
+  # ---------------------------------------------------------------- fast ----
+  # Quick answers. Groq first here rather than Cerebras: 30 RPM against 5 is
+  # the difference that matters for the mode people press most often, and
+  # gpt-oss-20b is the smaller, faster of the two Groq production models.
+  - model_name: fast
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      max_tokens: 12000
+      weight: 8
+      rpm: 30
+      tpm: 8000
+  - model_name: fast
+    litellm_params:
+      model: cerebras/gemma-4-31b
+      api_key: os.environ/CEREBRAS_API_KEY
+      max_tokens: 12000
+      weight: 2
+      rpm: 5
+      tpm: 30000
+  - model_name: fast
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3.5-lightning:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 12000
+      weight: 1
+
+  # ----------------------------------------------------------------- see ----
+  # Images. Left entirely on OpenRouter, unchanged from config.yaml.
+  #
+  # This is not an oversight. Groq's gpt-oss-120b model page does not list
+  # vision among its capabilities, and Cerebras publishes no vision model on
+  # the free tier. Routing an image to either would hand a screenshot to a
+  # text-only model. Until a direct provider offers a verified vision route,
+  # `see` stays where it works.
+  - model_name: see
+    litellm_params:
+      model: openrouter/nvidia/nemotron-nano-12b-v2-vl:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8000
+  - model_name: see
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8000
+
+  # ------------------------------------------------- NVIDIA NIM (unfilled) --
+  # LiteLLM addresses NVIDIA NIM as `nvidia_nim/<model>`, reading
+  # NVIDIA_NIM_API_KEY and optionally NVIDIA_NIM_API_BASE, which defaults to
+  # https://integrate.api.nvidia.com/v1/.
+  #
+  # No entry is written because no current NIM model ID has been verified. The
+  # examples in LiteLLM's provider page are older builds, and putting an
+  # unverified model string in a routing table is how a mode starts failing in
+  # a way nobody can explain. Add it here once a model has been confirmed to
+  # answer on the account that will serve it, with its own rpm/tpm from that
+  # account's quota page:
+  #
+  # - model_name: auto
+  #   litellm_params:
+  #     model: nvidia_nim/<verified-model-id>
+  #     api_key: os.environ/NVIDIA_NIM_API_KEY
+  #     max_tokens: 16000
+  #     weight: 2
+
+  # ---------------------------------------------------- Gemini (unfilled) ---
+  # LiteLLM addresses Google AI Studio as `gemini/<model>`, reading
+  # GEMINI_API_KEY.
+  #
+  # Left unfilled for two reasons, one of them not technical. Google does not
+  # publish free-tier RPM/TPM in its rate-limit documentation - it directs you
+  # to your own AI Studio quota page - so there is no honest number to put in
+  # rpm/tpm here. And the instruction covering Gemini restricts it to approved,
+  # non-confidential workloads: this gateway carries whatever a developer
+  # pastes into it, including proprietary source, and nothing in the portal
+  # separates an approved question from an unapproved one. Adding a Gemini
+  # route to a shared mode would route confidential code to it by default.
+  #
+  # If Gemini is wanted, it needs either a data-handling agreement covering
+  # everything the portal carries, or a separate mode that developers choose
+  # deliberately - which is a product decision, not a routing change.
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+
+router_settings:
+  # Weighted selection within a model group; see the note on `auto`.
+  #
+  # Two things about simple-shuffle, read from
+  # litellm/router_strategy/simple_shuffle.py in main-stable on 2026-08-21,
+  # because both change what this file actually does:
+  #
+  # 1. It picks the weighting metric by trying "weight", then "rpm", then
+  #    "tpm", and stops at the first one present on the FIRST healthy
+  #    deployment. Every entry above sets `weight`, so `weight` is what
+  #    selection uses - and the `rpm`/`tpm` values are therefore NOT consulted
+  #    when choosing a deployment. They bound the provider only reactively:
+  #    a 429 trips allowed_fails and cooldown_time takes that entry out for 30
+  #    seconds. If routing needs to respect provider capacity *before* hitting
+  #    the ceiling, this wants usage-based-routing-v2, or the `weight` lines
+  #    removed so `rpm` becomes the weighting metric. That is a live decision
+  #    for the routing phase, not something to change blind.
+  #
+  # 2. Deployments missing the chosen metric are weighted 0 - never selected,
+  #    silently. So any entry added to a weighted group MUST carry a `weight`,
+  #    including the NVIDIA template above. Adding one without it removes it
+  #    from rotation rather than adding it.
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 600
+  allowed_fails: 2
+  cooldown_time: 30
+  # Cross-mode fallbacks, unchanged from config.yaml. These stay within the
+  # four public model names, which every developer key is already scoped to.
+  # `see` is deliberately absent: the others are text-only.
+  fallbacks:
+    - auto: ["fast"]
+    - code: ["think"]
+    - think: ["code"]
+    - fast: ["auto"]
+
+litellm_settings:
+  set_verbose: false
+  drop_params: true

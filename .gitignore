@@ -1,0 +1,15 @@
+.env
+*.log
+node_modules/
+# Build output, wherever it is produced - the served bundle is built at deploy
+# time by portal/Dockerfile, so a committed copy is only ever a stale one.
+dist/
+.DS_Store
+*.pem
+*.key
+
+# SQLite database files
+portal/database/data/
+*.db
+*.db-wal
+*.db-shm

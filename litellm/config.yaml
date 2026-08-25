@@ -1,0 +1,101 @@
+# Model routing for the JSAN Dev AI gateway.
+#
+# The portal offers four logical modes and sends the mode name as the model
+# name (see DEV_MODELS in portal/backend/src/server.js), plus `see`, which is
+# not a mode a developer picks: the portal switches to it by itself for any
+# question that carries an image. The model_name values below MUST stay exactly
+# `auto`, `code`, `think`, `fast` and `see` — developer virtual keys are scoped
+# to those names at issue time.
+#
+# All four route through OpenRouter so the platform needs one credential
+# instead of one per provider. To move a mode onto a direct provider key
+# later, change its `model` and `api_key` here; nothing else changes.
+#
+# Every model below is on OpenRouter's free tier - the `:free` suffix is
+# what selects it, and a model without that suffix is billed. A key is
+# still required: free means no per-token charge, not no account.
+#
+# The free tier is rate limited per account, not per developer, and the
+# ceiling is far below what 20 seats at DEVELOPER_RPM_LIMIT would ask for.
+# Treat this roster as pilot/evaluation configuration.
+#
+# Adding a SECOND entry with the same model_name load-balances across both
+# (routing_strategy below) — that is how to add redundancy per mode.
+#
+# max_tokens covers reasoning AND answer on every model here, so it is set per
+# mode rather than uniformly: a full implementation answer needs the headroom, a
+# quick one does not. At 8000 across the board these models were being cut off
+# mid-file on ordinary code requests. Each value stays inside the model's own
+# output cap (laguna-s is the lowest, at 32768).
+
+model_list:
+  # Everyday work. 120B hybrid MoE activating 12B, 262k context.
+  - model_name: auto
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 16000
+
+  # Implementation, debugging, code review. Poolside's coding agent model,
+  # 118B total / 8B active, 262k context.
+  - model_name: code
+    litellm_params:
+      model: openrouter/poolside/laguna-s-2.1:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 16000
+
+  # Architecture and deeper reasoning. 550B frontier-reasoning MoE
+  # activating 55B, 1M context. Slowest of the four, as before.
+  - model_name: think
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 20000
+
+  # Quick answers and small tasks. 3B active of 30B, built for throughput.
+  - model_name: fast
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3.5-lightning:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 12000
+
+  # Images. The four modes above are text-in, text-out and cannot be given a
+  # screenshot at all, so anything with an image attached is routed here
+  # instead. Two entries under one name because the free tier hands out 429s:
+  # simple-shuffle spreads the load and a failing entry is cooled off rather
+  # than failing the question. The first is a purpose-built vision model and
+  # answers in about a second; the second is larger and slower but reasons.
+  - model_name: see
+    litellm_params:
+      model: openrouter/nvidia/nemotron-nano-12b-v2-vl:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8000
+  - model_name: see
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 8000
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 600
+  allowed_fails: 2
+  cooldown_time: 30
+  # If a mode's provider is failing or rate limited, serve the request from
+  # a neighbouring mode rather than returning an error to the developer.
+  # `see` is deliberately absent here - every other name is a text-only model,
+  # so falling back to one would hand it an image it cannot read.
+  fallbacks:
+    - auto: ["fast"]
+    - code: ["think"]
+    - think: ["code"]
+    - fast: ["auto"]
+
+litellm_settings:
+  set_verbose: false
+  drop_params: true
