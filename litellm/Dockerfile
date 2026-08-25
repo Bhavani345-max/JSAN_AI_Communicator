@@ -11,5 +11,11 @@ COPY config.yaml /app/config.yaml
 # receive the CMD below as arguments and fail with "Unknown command: sh".
 # Reset it so CMD runs directly. The shell form is required so ${PORT}
 # (injected by Railway) is expanded at runtime.
+#
+# --host :: rather than 0.0.0.0: Railway's private network is IPv6-only, so a
+# service bound to IPv4 alone is unreachable at <name>.railway.internal even
+# while it reports healthy. :: accepts both, so the public edge still works.
+# The portal reaches this over the private network, so binding IPv4 only leaves
+# /api/health reporting "gateway": false and every chat request failing.
 ENTRYPOINT []
-CMD ["sh", "-c", "litellm --config /app/config.yaml --host 0.0.0.0 --port ${PORT:-4000}"]
+CMD ["sh", "-c", "litellm --config /app/config.yaml --host :: --port ${PORT:-4000}"]
