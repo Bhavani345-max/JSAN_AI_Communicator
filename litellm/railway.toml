@@ -3,7 +3,21 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-healthcheckPath = "/health/readiness"
-healthcheckTimeout = 300
+# No healthcheckPath here on purpose.
+#
+# This service is private: the runbook says not to give LiteLLM a public
+# domain, and without one Railway records no target port for it, so the
+# platform healthcheck probes a port nothing is listening on and every deploy
+# fails after the full retry window - with the proxy up and serving the whole
+# time. The logs of such a deploy show "Uvicorn running on http://[::]:4000"
+# and "Application startup complete" alongside "1/1 replicas never became
+# healthy", which is the signature of a probe that never arrived rather than a
+# service that never started.
+#
+# Gateway health is still checked, one layer up: the portal's /api/health
+# calls /v1/models through LITELLM_BASE_URL and reports it as `gateway`. That
+# is the reachability that actually matters, because it tests the private
+# network path the portal really uses. Restore a healthcheck here only
+# alongside a domain, or Railway cannot reach it.
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

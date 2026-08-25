@@ -27,6 +27,14 @@ RUN apk add --no-cache su-exec
 RUN mkdir -p /data && chown node:node /data
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# chmod rather than trusting the source mode. A Windows checkout has no
+# POSIX execute bit, so whether this file arrives executable depends on how
+# the build context was produced: Docker Desktop on Windows hands COPY 0755
+# and the image works, while Railway builds from the git index and gets
+# whatever mode is recorded there. A non-executable ENTRYPOINT fails before
+# the process writes a single line, so the symptom is a container that dies
+# with an empty log. Setting it here makes the image correct either way.
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Stays root so the entrypoint can chown the volume; it execs `su-exec node`
 # before the server starts, so the Node process itself is never root.
