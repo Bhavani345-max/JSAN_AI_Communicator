@@ -10,4 +10,3 @@ npm run build:frontend
 
 echo "Starting application..."
 npm --prefix backend start
-
