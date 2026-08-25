@@ -769,6 +769,19 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
     let answer=''; let lastFlush=0;
     const flush=()=>{ const now=Date.now(); if(now-lastFlush<60) return; lastFlush=now; setStreamText(answer); };
     const controller=new AbortController(); abortRef.current=controller;
+    // Whether this turn is what creates the conversation. Read before the
+    // request because `active` is this render's value and does not change
+    // under us mid-send, even after the start event calls setActive.
+    const startedNew=!active;
+    // Set when this turn must not leave `active` pointing where it does:
+    // the server rolled back a conversation it had just created (it says so on
+    // the error event), or the id we sent was already gone. Either way the
+    // workspace is aimed at a row that no longer exists, and every later
+    // message would post the same dead id and fail the same way - with New
+    // chat the only way out and nothing on screen saying so.
+    let dropActive=false;
+    // Narrower: the id we sent 404'd outright, which is worth its own wording.
+    let gone=false;
     try{
       const res=await fetch('/api/chat',{
         method:'POST', credentials:'include',
@@ -777,7 +790,11 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
         signal:controller.signal
       });
       // Anything rejected before the stream opens still answers as plain JSON.
-      if(!res.ok||!res.body){ const d=await res.json().catch(()=>({})); throw new Error(d.error||'Request failed'); }
+      if(!res.ok||!res.body){
+        const d=await res.json().catch(()=>({}));
+        if(res.status===404){ gone=true; dropActive=true; }
+        throw new Error(d.error||'Request failed');
+      }
       let finished=false;
       for await (const {event,data} of readEvents(res.body)){
         // Keep reading after a reset so the server is never left writing into a
@@ -786,7 +803,10 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
         if(event==='start') setActive(data.conversationId);
         else if(event==='thinking') setThinking(true);
         else if(event==='delta'){ answer+=String(data.text||''); flush(); }
-        else if(event==='error') throw new Error(data.error||'AI is unavailable right now. Try again shortly.');
+        else if(event==='error'){
+          if(data.conversationDiscarded) dropActive=true;
+          throw new Error(data.error||'AI is unavailable right now. Try again shortly.');
+        }
         else if(event==='done'){
           finished=true;
           // Committing the message and dropping the live buffer together keeps
@@ -804,7 +824,20 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
       // Stopping on purpose is not a failure: whatever arrived is the answer,
       // and the server has already stored the same partial text.
       if(e?.name==='AbortError' && answer.trim()){ setMessages(m=>[...m,{role:'assistant',content:answer}]); refresh(); }
-      else { setMessages(m=>m.slice(0,-1)); setInput(base); setAttachments(sent); if(e?.name!=='AbortError') setError(e.message); refresh(); }
+      else {
+        // Stopped before any text arrived, or the connection dropped: no error
+        // event reached us, but the server rolled the turn back all the same,
+        // and that takes the conversation with it when this turn is what
+        // created it. It keeps a partial answer, so text having arrived is
+        // exactly the case where the conversation survives.
+        if(startedNew && !answer.trim()) dropActive=true;
+        setMessages(m=>m.slice(0,-1)); setInput(base); setAttachments(sent);
+        if(dropActive) setActive(null);
+        if(e?.name!=='AbortError') setError(gone
+          ? 'That conversation is no longer available. Your message is still in the composer - send it again to start a new one.'
+          : e.message);
+        refresh();
+      }
     }
     finally { abortRef.current=null; setBusy(false); setStreamText(''); setThinking(false) }
   };

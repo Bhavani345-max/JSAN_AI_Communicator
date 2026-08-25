@@ -63,11 +63,20 @@ model_list:
   # screenshot at all, so anything with an image attached is routed here
   # instead. Two entries under one name because the free tier hands out 429s:
   # simple-shuffle spreads the load and a failing entry is cooled off rather
-  # than failing the question. The first is a purpose-built vision model and
-  # answers in about a second; the second is larger and slower but reasons.
+  # than failing the question. The first is the quick answer, the second is
+  # larger and slower but reasons.
+  #
+  # The first entry was nvidia/nemotron-nano-12b-v2-vl:free, which OpenRouter
+  # has since withdrawn - it is no longer in /api/v1/models, so simple-shuffle
+  # sent roughly half of all image questions to a model that cannot answer.
+  # Gemma 4 26B A4B replaces it: free, vision-capable, and 4B active
+  # parameters, so it keeps the fast-first-entry shape this pair was built
+  # around. Check the catalog before swapping either of these - a withdrawn
+  # model fails at call time, not at boot, so config.yaml stays valid and only
+  # the questions break.
   - model_name: see
     litellm_params:
-      model: openrouter/nvidia/nemotron-nano-12b-v2-vl:free
+      model: openrouter/google/gemma-4-26b-a4b-it:free
       api_key: os.environ/OPENROUTER_API_KEY
       max_tokens: 8000
   - model_name: see

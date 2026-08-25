@@ -1025,12 +1025,25 @@ app.post('/api/chat', auth, chatLimiter, byUser, async (req, res) => {
   // A turn that produced no answer is removed again. Without this the question
   // stays in the developer's history with nothing under it, and every later
   // turn in that conversation resends it to the model as unanswered context.
+  //
+  // Whether it took the whole conversation with it is reported to the browser
+  // on the error event. The browser is holding this conversation's id as the
+  // one it will send with the next message, and a deleted id comes back 404 -
+  // so without being told, a single failed first turn leaves every later
+  // message in that workspace failing too, with New chat the only way out and
+  // nothing on screen saying so. It cannot infer this: the same rollback
+  // deletes only the question when the conversation already existed.
+  let conversationDiscarded = false;
   const discardTurn = () => {
     try {
       // Both cascade to jsan_message_images, so a discarded turn takes its
       // screenshots with it rather than orphaning them in the database.
-      if (conversationIsNew) db.prepare('DELETE FROM jsan_conversations WHERE id=?').run(cid);
-      else db.prepare('DELETE FROM jsan_messages WHERE id=?').run(userMessageId);
+      if (conversationIsNew) {
+        db.prepare('DELETE FROM jsan_conversations WHERE id=?').run(cid);
+        conversationDiscarded = true;
+      } else {
+        db.prepare('DELETE FROM jsan_messages WHERE id=?').run(userMessageId);
+      }
     } catch (e) {
       console.error('Could not roll back the failed turn:', e.message);
     }
@@ -1158,7 +1171,8 @@ app.post('/api/chat', auth, chatLimiter, byUser, async (req, res) => {
           error: timedOut
             ? 'The model stopped responding. Try again, or use Fast mode for a quicker answer.'
             : e instanceof ChatUserError ? e.message
-            : cleanError(e, 'AI is unavailable right now. Try again shortly.')
+            : cleanError(e, 'AI is unavailable right now. Try again shortly.'),
+          conversationDiscarded
         });
       }
     }
