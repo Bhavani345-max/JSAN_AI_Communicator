@@ -151,10 +151,31 @@ check('spending a code is what stops it being spent twice', () => {
   assert.throws(spend, /already used/);
 });
 
+check('a redemption names the developer a code let in', () => {
+  db.prepare('INSERT INTO jsan_access_code_redemptions(id,code_id,user_id,email) VALUES(?,?,?,?)')
+    .run(crypto.randomUUID(), accessCodeId, userId, 'dev@jsanconsulting.com');
+  const row = db.prepare(`SELECT r.email, c.code_hint FROM jsan_access_code_redemptions r
+    JOIN jsan_access_codes c ON c.id = r.code_id WHERE r.user_id = ?`).get(userId);
+  assert.equal(row?.email, 'dev@jsanconsulting.com');
+  assert.equal(row?.code_hint, 'JSAN-...-9K2Q');
+});
+
+check('a redemption cannot point at a code that was never issued', () => {
+  assert.throws(() => db.prepare('INSERT INTO jsan_access_code_redemptions(id,code_id,user_id,email) VALUES(?,?,?,?)')
+    .run(crypto.randomUUID(), 'ghost-code', userId, 'nobody@jsanconsulting.com'), /FOREIGN KEY/i);
+});
+
 check('deleting a user cascades to conversations and messages', () => {
   db.prepare('DELETE FROM jsan_users WHERE id=?').run(userId);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM jsan_conversations').get().n, 0, 'conversations survived');
   assert.equal(db.prepare('SELECT COUNT(*) n FROM jsan_messages').get().n, 0, 'messages survived');
+});
+
+check('a redemption survives the developer whose account is removed', () => {
+  const row = db.prepare('SELECT user_id,email FROM jsan_access_code_redemptions WHERE code_id=?').get(accessCodeId);
+  assert.ok(row, 'the redemption was deleted with the user');
+  assert.equal(row.user_id, null, 'user_id was not cleared');
+  assert.equal(row.email, 'dev@jsanconsulting.com', 'the address was lost');
 });
 
 check('an issued code outlives the admin who issued it', () => {
@@ -162,6 +183,12 @@ check('an issued code outlives the admin who issued it', () => {
   assert.ok(row, 'the access code was deleted with its author');
   assert.equal(row.created_by, null, 'created_by was not cleared');
   assert.equal(row.uses, 1, 'the usage record was lost');
+});
+
+check('deleting a code takes its redemptions with it', () => {
+  db.prepare('DELETE FROM jsan_access_codes WHERE id=?').run(accessCodeId);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jsan_access_code_redemptions').get().n, 0,
+    'a redemption outlived the code it points at');
 });
 
 check('the database is still structurally sound', () => assert.deepEqual(checkIntegrity(db), []));

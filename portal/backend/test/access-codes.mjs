@@ -131,18 +131,20 @@ await check('an admin can generate a code bound to one developer', async () => {
   personalCode = data.code; personalId = data.entry.id;
 });
 
-await check('the code list shows a hint, never the code', async () => {
+await check('an admin can read every code back at any time', async () => {
   const { data } = await admin('GET', '/api/admin/access-codes');
   const entry = data.codes.find(c => c.id === personalId);
   assert.ok(entry, 'the issued code is not listed');
+  assert.equal(entry.code, personalCode, 'the list does not carry the code itself');
+  assert.equal(entry.readable, true);
   assert.ok(entry.hint.includes('…'), `hint is not masked: ${entry.hint}`);
-  assert.ok(!JSON.stringify(data).includes(personalCode), 'the list leaked a plaintext code');
+  assert.ok(data.codes.every(c => typeof c.code === 'string'), 'some codes came back unreadable');
 });
 
-await check('an admin can read a code back after leaving the page', async () => {
-  const { status, data } = await admin('GET', `/api/admin/access-codes/${personalId}/reveal`);
-  assert.equal(status, 200, JSON.stringify(data));
-  assert.equal(data.code, personalCode);
+await check('the codes are for admins only - nobody else can list them', async () => {
+  const other = client();
+  await other('POST', '/api/auth/login', { email: 'developerai@jsan.com', password: 'developerai@333' });
+  assert.equal((await other('GET', '/api/admin/access-codes')).status, 403);
 });
 
 await check('registration is refused without a code', async () => {
@@ -238,15 +240,15 @@ await check('an unbound code lets any allowed address register', async () => {
 });
 
 await check('a code cannot be bound to an address outside the allowed domain', async () => {
-  const { status, data } = await admin('POST', '/api/admin/access-codes', { assignedEmail: 'outsider@gmail.com' });
-  assert.equal(status, 400, JSON.stringify(data));
-  assert.match(data.error, /jsan\.com/);
+  const { data } = await admin('POST', '/api/admin/access-codes', { assignedEmail: 'outsider@gmail.com' });
+  assert.equal(data.issued.length, 0, 'a code was issued for an address that could never use it');
+  assert.match(data.skipped[0].error, /jsan\.com/);
 });
 
 await check('a code cannot be bound to somebody who already has an account', async () => {
-  const { status, data } = await admin('POST', '/api/admin/access-codes', { assignedEmail: 'ravi@jsan.com' });
-  assert.equal(status, 409, JSON.stringify(data));
-  assert.match(data.error, /already has an account/);
+  const { data } = await admin('POST', '/api/admin/access-codes', { assignedEmail: 'ravi@jsan.com' });
+  assert.equal(data.issued.length, 0, 'a code was issued to somebody who is already registered');
+  assert.match(data.skipped[0].error, /already has an account/i);
 });
 
 await check('nonsense limits are refused rather than coerced', async () => {
@@ -273,7 +275,98 @@ await check('a code can be deleted outright', async () => {
   assert.equal(gone.status, 200);
   const { data } = await admin('GET', '/api/admin/access-codes');
   assert.ok(!data.codes.some(c => c.id === issued.data.entry.id), 'the deleted code is still listed');
-  assert.equal((await admin('GET', `/api/admin/access-codes/${issued.data.entry.id}/reveal`)).status, 404);
+  assert.equal((await admin('POST', `/api/admin/access-codes/${issued.data.entry.id}/revoke`)).status, 404);
+});
+
+
+await check('an admin can issue codes for a whole list in one submission', async () => {
+  const { status, data } = await admin('POST', '/api/admin/access-codes', {
+    label: 'October intake',
+    assignedEmails: 'kiran@jsan.com, meera@jsan.com\nsuresh@jsan.com',
+    maxUses: 1, expiresInDays: 30
+  });
+  assert.equal(status, 201, JSON.stringify(data));
+  assert.equal(data.issued.length, 3, `expected 3 codes, got ${data.issued.length}`);
+  assert.deepEqual(data.issued.map(i => i.email), ['kiran@jsan.com', 'meera@jsan.com', 'suresh@jsan.com']);
+  assert.equal(data.skipped.length, 0, JSON.stringify(data.skipped));
+  const codes = new Set(data.issued.map(i => i.code));
+  assert.equal(codes.size, 3, 'two developers were given the same code');
+  for (const one of data.issued) {
+    assert.match(one.code, /^JSAN-[A-Z2-9]{5}-[A-Z2-9]{5}-[A-Z2-9]{5}$/);
+    assert.equal(one.entry.assignedEmail, one.email);
+    assert.equal(one.entry.label, 'October intake');
+  }
+});
+
+await check('one bad address in a pasted list does not cost the good ones', async () => {
+  const { status, data } = await admin('POST', '/api/admin/access-codes', {
+    assignedEmails: ['deepa@jsan.com', 'not-an-email', 'outsider@gmail.com', 'ravi@jsan.com', 'kiran@jsan.com']
+  });
+  assert.equal(status, 201, JSON.stringify(data));
+  assert.deepEqual(data.issued.map(i => i.email), ['deepa@jsan.com']);
+  const reasons = Object.fromEntries(data.skipped.map(sk => [sk.email, sk.error]));
+  assert.match(reasons['not-an-email'], /valid email/);
+  assert.match(reasons['outsider@gmail.com'], /jsan\.com/);
+  assert.match(reasons['ravi@jsan.com'], /already has an account/i);
+  assert.match(reasons['kiran@jsan.com'], /unused code/i);
+});
+
+await check('the same address listed twice gets one code, not two', async () => {
+  const { data } = await admin('POST', '/api/admin/access-codes', {
+    assignedEmails: 'vikram@jsan.com, VIKRAM@jsan.com\n vikram@jsan.com '
+  });
+  assert.equal(data.issued.length, 1, `expected 1 code, got ${data.issued.length}`);
+  assert.equal(data.skipped.length, 0, JSON.stringify(data.skipped));
+});
+
+await check('a list longer than the batch limit is refused outright', async () => {
+  const many = Array.from({ length: 51 }, (_, i) => `bulk${i}@jsan.com`);
+  const { status, data } = await admin('POST', '/api/admin/access-codes', { assignedEmails: many });
+  assert.equal(status, 400, JSON.stringify(data));
+  assert.match(data.error, /at most 50/);
+  const listed = await admin('GET', '/api/admin/access-codes');
+  assert.ok(!listed.data.codes.some(c => c.assignedEmail === 'bulk0@jsan.com'), 'a refused batch still wrote codes');
+});
+
+await check('the developer list names the code that let each person in', async () => {
+  const { status, data } = await admin('GET', '/api/admin/users');
+  assert.equal(status, 200, JSON.stringify(data));
+  const ravi = data.users.find(u => u.email === 'ravi@jsan.com');
+  assert.ok(ravi, 'the registered developer is missing');
+  assert.equal(ravi.admittedBy, 'issued-code');
+  assert.equal(ravi.accessCode?.code, personalCode, 'the wrong code is attributed to this developer');
+  assert.equal(ravi.accessCode?.label, 'For Ravi');
+  assert.ok(ravi.redeemedAt, 'no redemption time recorded');
+  assert.equal(ravi.isAdmin, false);
+
+  const boss = data.users.find(u => u.email === 'admindev@jsan.com');
+  assert.equal(boss.admittedBy, 'seed-account', 'a declared account is not labelled as one');
+  assert.equal(boss.accessCode, null);
+  assert.equal(boss.isAdmin, true);
+});
+
+await check('a code used by two developers is attributed to each of them', async () => {
+  const { data } = await admin('GET', '/api/admin/users');
+  const anita = data.users.find(u => u.email === 'anita@jsan.com');
+  const bala = data.users.find(u => u.email === 'bala@jsan.com');
+  assert.equal(anita.admittedBy, 'issued-code');
+  assert.equal(bala.admittedBy, 'issued-code');
+  assert.equal(anita.accessCode.id, bala.accessCode.id, 'they did not share the two-use code');
+  assert.equal(anita.accessCode.uses, 2);
+  assert.equal(anita.accessCode.code, bala.accessCode.code);
+});
+
+await check('the developer list is admin-only', async () => {
+  const other = client();
+  await other('POST', '/api/auth/login', { email: 'developerai@jsan.com', password: 'developerai@333' });
+  assert.equal((await other('GET', '/api/admin/users')).status, 403);
+  assert.equal((await client()('GET', '/api/admin/users')).status, 401);
+});
+
+await check('the overview counts seats already promised to unspent codes', async () => {
+  const { data } = await admin('GET', '/api/admin/overview');
+  assert.equal(typeof data.outstandingCodeUses, 'number');
+  assert.ok(data.outstandingCodeUses >= 4, `expected outstanding codes, got ${data.outstandingCodeUses}`);
 });
 
 for (const name of passed) console.log(`  PASS  ${name}`);

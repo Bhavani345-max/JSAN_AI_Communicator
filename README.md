@@ -39,17 +39,26 @@ on this.
 
 Registering from the sign-in screen asks for a username, work email, the
 password twice, and a team access code. An account listed in `ADMIN_EMAILS`
-gets an Admin page, and generates those codes one at a time: name the developer
-the code is for and only that address can spend it, set how many times it may
-be used and when it lapses, then copy the ready-written message and send it to
-them. A code is shown in full when it is generated and again on Reveal — the
-list itself carries only a hint, so the page can be on screen in a meeting.
-Withdrawing a code refuses it from that moment on without touching anybody
-else's, which the single shared `REGISTRATION_ACCESS_CODE` could never do; that
-variable still works where it is set, and leaving it unset makes issued codes
-the only way in. Three wrong passwords lock that address for 30 minutes; the
-count lives in the database rather than in process memory, so restarting the
-portal does not hand the allowance back.
+gets an Admin page, which is where those codes come from. Paste in a whole
+intake — one address per line, or comma-separated — and one submission cuts a
+code each, bound so that only the named address can spend it; a bad line is
+reported beside the codes rather than costing the rest of the list. Set how
+many times a code may be used and when it lapses, then copy the ready-written
+message for each developer. Leave the address box empty for a single code
+anybody on the team may use.
+
+The Admin page also answers the other direction: **Developers** lists everyone
+with a seat beside the code that let them in, so an admin who is asked "what
+was my code again?" can read it off months later. Every code is shown in full,
+because a code nobody can look up is a code that has to be reissued; one
+control blanks them all out for a screen share. Withdrawing a code refuses it
+from that moment on without touching anybody else's, which the single shared
+`REGISTRATION_ACCESS_CODE` could never do; that variable still works where it
+is set, and leaving it unset makes issued codes the only way in.
+
+Three wrong passwords lock that address for 30 minutes; the count lives in the
+database rather than in process memory, so restarting the portal does not hand
+the allowance back.
 
 One developer may have two model calls running at once — `/api/chat`,
 `/api/documents` and `/v1` draw on the same allowance, and the third simultaneous
@@ -72,6 +81,13 @@ backend, so the UI works from there and not from 8080. `npm run dev:backend` and
 `npm run dev:frontend` run either half alone, which is also how to get Vite's
 interactive shortcuts back; `npm run dev` cannot offer them, because two
 processes cannot share one terminal's input.
+
+The browser icons in `frontend/public` are generated rather than drawn:
+`npm run icons` writes the SVG favicon, its PNG fallback and the iOS
+home-screen icon from one description of the JSAN mark in
+`frontend/scripts/icons.mjs`, so they cannot drift apart. Run it after changing
+that file; the build itself does not, since the icons change about as often as
+the logo does.
 
 None of the `dev` scripts install dependencies — a restart should not pay for
 that every time. After cloning, run `npm run check:backend && npm run

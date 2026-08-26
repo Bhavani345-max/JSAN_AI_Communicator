@@ -443,13 +443,6 @@
 .admin-submit{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .admin-hint{font-size:9px;color:var(--muted)}
 
-/* The one place a freshly issued code is shown in full. */
-.issued-code{margin-top:18px;border:1px solid var(--accent);border-radius:13px;background:color-mix(in srgb,var(--soft) 60%,var(--panel));padding:17px}
-.issued-code>strong{display:block;font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:800}
-.issued-code .code-value{margin-top:11px;display:flex;align-items:center;gap:9px;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:11px 9px 11px 13px}
-.issued-code .code-value code{flex:1;min-width:0;font-size:16px;font-weight:750;letter-spacing:.05em;overflow:auto;white-space:nowrap}
-.issued-code>p{font-size:9px;color:var(--muted);margin:11px 0 0;line-height:1.55}
-.issued-actions{margin-top:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 
 .admin-note{margin-top:16px;display:flex;gap:9px;align-items:flex-start;border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:11px 12px}
 .admin-note svg{flex:none;margin-top:1px;color:var(--muted)}
@@ -482,4 +475,40 @@
   .admin-form{grid-template-columns:minmax(0,1fr)}
   .code-row{grid-template-columns:minmax(0,1fr)}
   .code-actions{justify-content:flex-end}
+}
+.admin-form textarea{border:1px solid var(--line2);border-radius:9px;padding:10px 11px;background:var(--panel);font-size:11px;line-height:1.6;outline:0;color:var(--text);resize:vertical;min-height:82px;font-family:inherit}
+.admin-form textarea:focus{border-color:#8c9cf6;box-shadow:0 0 0 3px rgba(53,88,232,.09)}
+.admin-form textarea:disabled{opacity:.55}
+/* A count or a duration in a full-width row should not stretch to the page. */
+.admin-form .full-row.narrow input{max-width:220px}
+
+/* What one submission produced: the codes, and the addresses it skipped. */
+.issue-result{margin-top:18px;border:1px solid var(--accent);border-radius:13px;background:color-mix(in srgb,var(--soft) 60%,var(--panel));padding:17px}
+.issue-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.issue-head strong{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:800}
+.issued-list{margin-top:12px;display:grid;gap:7px}
+.issued-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:9px 9px 9px 13px}
+.issued-who{font-size:10px;color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.issued-code-value{display:flex;align-items:center;gap:7px;min-width:0}
+.code-large{font-size:14px;font-weight:750;letter-spacing:.05em;white-space:nowrap}
+.issue-skipped{margin-top:14px;border-top:1px solid var(--line);padding-top:13px}
+.issue-skipped strong{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:800}
+.issue-skipped p{margin:7px 0 0;font-size:9px;color:var(--muted);display:flex;gap:9px}
+.issue-skipped p span{flex:0 0 auto;font-weight:750;color:var(--text)}
+.issue-dismiss{margin-top:14px}
+
+.admin-note.warn{border-color:#e8cdb4;background:#fdf6ee}
+.admin-note.warn svg{color:#b16a11}
+[data-theme="dark"] .admin-note.warn{border-color:#4a3520;background:#241a0e}
+[data-theme="dark"] .admin-note.warn svg{color:#e0a86a}
+
+.user-name{font-size:11px}
+.code-actions.user-code{gap:7px}
+.code-none,.code-unreadable{font-size:9px;color:var(--muted);font-style:italic}
+.status-pill.admin{color:#3a5488;background:#eef2fb;border-color:#ccd8ef}
+[data-theme="dark"] .status-pill.admin{color:#9ab4f0;background:#161f34;border-color:#2b3a5c}
+
+@media (max-width:900px){
+  .issued-row{grid-template-columns:minmax(0,1fr);gap:8px}
+  .admin-form .full-row.narrow input{max-width:none}
 }

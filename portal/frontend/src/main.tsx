@@ -8,7 +8,7 @@ import {
   Sun, Terminal, Trash2, Wrench, X, Zap, BrainCircuit, Bug, GitPullRequest,
   Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2, Lock, TriangleAlert,
   Presentation, FileUp, LoaderCircle, Palette, Ticket, Plus, Ban, Eye, EyeOff,
-  Mail, Info
+  Mail, Info, Users
 } from 'lucide-react';
 import 'highlight.js/styles/github-dark.css';
 import './styles.css';
@@ -1177,18 +1177,29 @@ function SlidesPage() {
   </div>;
 }
 
-/** One issued team access code, as the admin list reports it. The code itself
- *  is never in here — only a hint — until Reveal asks for it by id. */
+/** One issued team access code. `code` is the code itself — the admin list
+ *  carries it for every row, so a developer's code can be looked up at any
+ *  time. It is null only where the row cannot be decrypted any more. */
 type AccessCode = {
-  id:string; hint:string; label:string; assignedEmail:string|null;
+  id:string; code:string|null; readable:boolean; hint:string; label:string; assignedEmail:string|null;
   maxUses:number; uses:number; remaining:number;
   status:'active'|'used'|'expired'|'revoked';
   createdAt:string; expiresAt:string|null; revokedAt:string|null;
   lastUsedAt:string|null; lastUsedBy:string|null; createdByEmail:string|null;
 };
+type IssuedCode = { email:string|null; code:string; entry:AccessCode };
+type SkippedEmail = { email:string; error:string };
+type IssueResult = { issued:IssuedCode[]; skipped:SkippedEmail[]; warning:string|null };
+/** A registered developer, and the code that let them in. */
+type AdminUser = {
+  id:string; name:string; email:string; createdAt:string; lastLoginAt:string|null; isAdmin:boolean;
+  admittedBy:'issued-code'|'seed-account'|'shared-code';
+  redeemedAt:string|null; accessCode:AccessCode|null;
+};
 type AdminOverview = {
   registeredUsers:number; maxUsers:number; seatsRemaining:number; registrationOpen:boolean;
-  activeCodes:number; totalCodes:number; emailDomain:string|null; sharedCodeEnabled:boolean;
+  activeCodes:number; totalCodes:number; outstandingCodeUses:number;
+  emailDomain:string|null; sharedCodeEnabled:boolean;
   admins:string[]; limits:{defaultExpiryDays:number; maxUses:number; maxExpiryDays:number};
 };
 
@@ -1203,6 +1214,18 @@ const EXPIRY_CHOICES = [
 
 const STATUS_TEXT:Record<AccessCode['status'],string> = {
   active:'Ready to send', used:'Used', expired:'Expired', revoked:'Withdrawn'
+};
+
+/** How each developer got in, for the Developers list. */
+const ADMITTED_TEXT:Record<AdminUser['admittedBy'],string> = {
+  'issued-code':'Issued code',
+  'seed-account':'Seed account',
+  'shared-code':'Shared code'
+};
+const ADMITTED_NOTE:Record<AdminUser['admittedBy'],string> = {
+  'issued-code':'Registered with a code generated here.',
+  'seed-account':'Declared in SEED_ACCOUNTS, so it has no access code.',
+  'shared-code':'Registered on the shared REGISTRATION_ACCESS_CODE, or before codes were issued per developer.'
 };
 
 const shortDate = (iso:string|null) =>
@@ -1234,31 +1257,44 @@ function inviteMessage(code:string, entry:AccessCode) {
   ].join('\n');
 }
 
+/** Every code from one batch as `address<TAB>code` lines, for a spreadsheet. */
+function batchAsRows(issued:IssuedCode[]) {
+  return issued.map(one=>`${one.email || '(anyone on the team)'}\t${one.code}`).join('\n');
+}
+
 /**
- * Admin: issue a team access code to one developer.
+ * Admin: issue team access codes and see who holds which one.
  *
  * Only mounted for an account in ADMIN_EMAILS, and every route it calls checks
  * that again server-side — the hidden nav entry is a convenience, not the
- * control. A code is shown in full exactly twice: in the panel that appears
- * when it is generated, and when Reveal is pressed for it. The list itself
- * carries hints, so this page can be on screen in a meeting without handing
- * anybody a seat.
+ * control. Codes are shown in full, because an admin has to be able to answer
+ * "what is my code?" long after issuing it; "Hide codes" blanks them for a
+ * screen share without reloading anything.
  */
 function AdminPage() {
   const [overview,setOverview] = useState<AdminOverview|null>(null);
   const [codes,setCodes] = useState<AccessCode[]>([]);
-  const [form,setForm] = useState({assignedEmail:'',label:'',maxUses:'1',expiresInDays:'14'});
-  const [issued,setIssued] = useState<{code:string;entry:AccessCode}|null>(null);
-  // Codes read back from /reveal, kept per id so several can be open at once.
-  const [revealed,setRevealed] = useState<Record<string,string>>({});
+  const [users,setUsers] = useState<AdminUser[]>([]);
+  const [form,setForm] = useState({emails:'',label:'',maxUses:'1',expiresInDays:'14'});
+  const [result,setResult] = useState<IssueResult|null>(null);
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState('');
   const [loading,setLoading] = useState(true);
+  // Kept across visits, because whoever screen-shares this page once usually
+  // screen-shares it again. Wrapped: Safari in private mode throws on read.
+  const [showCodes,setShowCodes] = useState(()=>{
+    try { return localStorage.getItem('jsan-admin-codes') !== 'hidden'; } catch { return true; }
+  });
+  useEffect(()=>{
+    try { localStorage.setItem('jsan-admin-codes', showCodes?'shown':'hidden'); } catch {}
+  },[showCodes]);
 
   const load = useCallback(async()=>{
     try {
-      const [summary,list] = await Promise.all([api('/api/admin/overview'),api('/api/admin/access-codes')]);
-      setOverview(summary); setCodes(list.codes);
+      const [summary,codeList,userList] = await Promise.all([
+        api('/api/admin/overview'), api('/api/admin/access-codes'), api('/api/admin/users')
+      ]);
+      setOverview(summary); setCodes(codeList.codes); setUsers(userList.users);
     } catch(e:any){ setError(e.message); }
     finally { setLoading(false); }
   },[]);
@@ -1266,31 +1302,30 @@ function AdminPage() {
 
   const set = (patch:Partial<typeof form>)=>setForm(f=>({...f,...patch}));
 
+  // What the addresses box will be read as, so the button can say how many
+  // codes are about to exist before it is pressed.
+  const requested = useMemo(
+    ()=>[...new Set(form.emails.split(/[,;\s]+/).map(v=>v.trim().toLowerCase()).filter(Boolean))],
+    [form.emails]
+  );
+
   const generate = async(e:React.FormEvent)=>{
     e.preventDefault();
-    setBusy(true); setError(''); setIssued(null);
+    setBusy(true); setError(''); setResult(null);
     try {
       const data = await api('/api/admin/access-codes',{method:'POST',body:JSON.stringify({
-        assignedEmail: form.assignedEmail.trim(),
+        assignedEmails: requested,
         label: form.label.trim(),
         maxUses: Number(form.maxUses),
         expiresInDays: Number(form.expiresInDays)
       })});
-      setIssued(data);
-      // The email and note belong to the person it was just cut for; the limits
-      // are the admin's working defaults and are left where they set them.
-      setForm(f=>({...f,assignedEmail:'',label:''}));
+      setResult({issued:data.issued, skipped:data.skipped, warning:data.warning});
+      // The addresses and the note belong to the people it was just cut for;
+      // the limits are the admin's working defaults and are left alone.
+      setForm(f=>({...f,emails:'',label:''}));
       load();
     } catch(e:any){ setError(e.message); }
     finally { setBusy(false); }
-  };
-
-  const reveal = async(entry:AccessCode)=>{
-    setError('');
-    try {
-      const data = await api(`/api/admin/access-codes/${entry.id}/reveal`);
-      setRevealed(r=>({...r,[entry.id]:data.code}));
-    } catch(e:any){ setError(e.message); }
   };
 
   const revoke = async(entry:AccessCode)=>{
@@ -1305,20 +1340,33 @@ function AdminPage() {
     setError('');
     try {
       await api(`/api/admin/access-codes/${entry.id}`,{method:'DELETE'});
-      setRevealed(r=>{ const next={...r}; delete next[entry.id]; return next; });
-      if(issued?.entry.id===entry.id) setIssued(null);
+      setResult(r=>r ? {...r, issued:r.issued.filter(one=>one.entry.id!==entry.id)} : r);
       await load();
     } catch(e:any){ setError(e.message); }
   };
 
   const domain = overview?.emailDomain;
+  const overCapacity = !!overview && overview.registeredUsers + overview.outstandingCodeUses > overview.maxUsers;
+  const buttonLabel = busy ? 'Generating…'
+    : requested.length > 1 ? `Generate ${requested.length} codes`
+    : 'Generate code';
+
+  /** A code cell, blanked to its hint while codes are hidden. */
+  const codeCell = (entry:AccessCode, size:'row'|'large'='row') => {
+    if(!entry.readable) return <span className="code-unreadable" title="Issued before the encryption secret was rotated, so it cannot be read back. It still works for whoever holds it.">Cannot be read back</span>;
+    const value = entry.code as string;
+    return <>
+      <code className={size==='large'?'code-large':''}>{showCodes ? value : entry.hint}</code>
+      <CopyButton value={value} small={size==='row'}/>
+    </>;
+  };
 
   return <div className="page">
     <header className="page-header">
       <div>
         <span className="eyebrow">Admin</span>
-        <h1>Give one developer one seat.</h1>
-        <p>Generate a team access code, send it to the person it is for, and it stops working the moment they have used it.</p>
+        <h1>Give the team their seats.</h1>
+        <p>Paste in as many developers as you like and generate a code each in one go, then send everyone the code that is theirs.</p>
       </div>
       {overview && <div className="header-badge">
         <span/><strong>{overview.registeredUsers} of {overview.maxUsers} seats used</strong>
@@ -1331,31 +1379,27 @@ function AdminPage() {
       <section className="metric-card"><span>Developers registered</span><strong>{overview?.registeredUsers ?? 0}</strong><small>{overview?.registrationOpen ? 'Registration is open' : 'Every seat is taken'}</small></section>
       <section className="metric-card"><span>Seats remaining</span><strong>{overview?.seatsRemaining ?? 0}</strong><small>Of {overview?.maxUsers ?? 0} configured</small></section>
       <section className="metric-card"><span>Codes ready to send</span><strong>{overview?.activeCodes ?? 0}</strong><small>{overview?.totalCodes ?? 0} issued in total</small></section>
-      <section className="metric-card"><span>Admins</span><strong>{overview?.admins.length ?? 0}</strong><small>Set by ADMIN_EMAILS</small></section>
+      <section className="metric-card"><span>Seats already promised</span><strong>{overview?.outstandingCodeUses ?? 0}</strong><small>{overCapacity ? 'More than the seats left' : 'Codes issued but not yet used'}</small></section>
 
+      {/* ---- Generate --------------------------------------------------- */}
       <section className="card span-2">
         <div className="card-head simple">
           <div>
             <div className="card-icon"><Ticket size={17}/></div>
-            <div><h2>Generate a team access code</h2><p>Leave the email blank for a code anyone on the team may use, or name one developer so nobody else can spend it.</p></div>
+            <div><h2>Generate team access codes</h2><p>One address per line, or separated by commas. Each developer gets their own code that nobody else can spend. Leave the box empty for a single code anyone on the team may use.</p></div>
           </div>
         </div>
 
         <form className="admin-form" onSubmit={generate}>
-          <label>
-            <span className="label-text">Developer email <i>optional</i></span>
-            <input type="email" value={form.assignedEmail} onChange={e=>set({assignedEmail:e.target.value})}
-              placeholder={`name@${domain || 'yourcompany.com'}`} disabled={busy}/>
+          <label className="full-row">
+            <span className="label-text">Developer emails <i>one per line — optional</i></span>
+            <textarea rows={4} value={form.emails} onChange={e=>set({emails:e.target.value})} disabled={busy}
+              placeholder={`kiran@${domain || 'yourcompany.com'}\nmeera@${domain || 'yourcompany.com'}\nsuresh@${domain || 'yourcompany.com'}`}/>
           </label>
           <label>
             <span className="label-text">Note <i>optional</i></span>
             <input value={form.label} onChange={e=>set({label:e.target.value})} maxLength={80}
-              placeholder="Who it is for, or which team" disabled={busy}/>
-          </label>
-          <label>
-            <span className="label-text">How many times it may be used</span>
-            <input type="number" min={1} max={overview?.limits.maxUses ?? 20} value={form.maxUses}
-              onChange={e=>set({maxUses:e.target.value})} disabled={busy}/>
+              placeholder="Which team or intake this is for" disabled={busy}/>
           </label>
           <label>
             <span className="label-text">Expires</span>
@@ -1363,25 +1407,43 @@ function AdminPage() {
               {EXPIRY_CHOICES.map(choice=><option key={choice.value} value={choice.value}>{choice.label}</option>)}
             </select>
           </label>
+          <label className="full-row narrow">
+            <span className="label-text">How many times each code may be used</span>
+            <input type="number" min={1} max={overview?.limits.maxUses ?? 20} value={form.maxUses}
+              onChange={e=>set({maxUses:e.target.value})} disabled={busy}/>
+          </label>
           <div className="full-row admin-submit">
-            <button className="primary-button" disabled={busy}><Plus size={14}/>{busy?'Generating…':'Generate code'}</button>
-            {domain && <span className="admin-hint">Registration accepts {domain} addresses only.</span>}
+            <button className="primary-button" disabled={busy}><Plus size={14}/>{buttonLabel}</button>
+            <span className="admin-hint">
+              {requested.length > 1
+                ? `${requested.length} developers, one code each.`
+                : domain ? `Registration accepts ${domain} addresses only.` : 'Leave the box empty for one shared-use code.'}
+            </span>
           </div>
         </form>
 
-        {issued && <div className="issued-code">
-          <strong>Send this to {issued.entry.assignedEmail || 'the developer'}</strong>
-          <div className="code-value">
-            <code>{issued.code}</code>
-            <CopyButton value={issued.code}/>
-          </div>
-          <p>Shown in full here and nowhere else in the list. You can read it back later with Reveal, but sending it now is simpler.</p>
-          <div className="issued-actions">
-            <button type="button" className="secondary-button" onClick={()=>navigator.clipboard.writeText(inviteMessage(issued.code,issued.entry))}>
-              <Mail size={14}/>Copy the message to send
-            </button>
-            <button type="button" className="text-button" onClick={()=>setIssued(null)}>Done</button>
-          </div>
+        {result && <div className="issue-result">
+          {result.issued.length > 0 && <>
+            <div className="issue-head">
+              <strong>{result.issued.length === 1 ? 'Send this code to the developer it is for' : `${result.issued.length} codes — send each one to the developer it names`}</strong>
+              {result.issued.length > 1 && <button type="button" className="text-button"
+                onClick={()=>navigator.clipboard.writeText(batchAsRows(result.issued))}>Copy all as a list</button>}
+            </div>
+            <div className="issued-list">{result.issued.map(one=><div key={one.entry.id} className="issued-row">
+              <div className="issued-who">{one.email || 'Anyone on the team'}</div>
+              <div className="issued-code-value">{codeCell(one.entry,'large')}</div>
+              <button type="button" className="secondary-button" title="Copy a ready-written message for this developer"
+                onClick={()=>navigator.clipboard.writeText(inviteMessage(one.code,one.entry))}><Mail size={13}/>Message</button>
+            </div>)}</div>
+          </>}
+
+          {result.skipped.length > 0 && <div className="issue-skipped">
+            <strong>{result.skipped.length} not issued</strong>
+            {result.skipped.map(one=><p key={one.email}><span>{one.email}</span>{one.error}</p>)}
+          </div>}
+
+          {result.warning && <div className="admin-note warn"><TriangleAlert size={14}/><p>{result.warning}</p></div>}
+          <button type="button" className="text-button issue-dismiss" onClick={()=>setResult(null)}>Done</button>
         </div>}
 
         {overview?.sharedCodeEnabled && <div className="admin-note">
@@ -1390,12 +1452,52 @@ function AdminPage() {
         </div>}
       </section>
 
+      {/* ---- Developers -------------------------------------------------- */}
       <section className="card span-2">
-        <div className="card-head simple">
+        <div className="card-head">
+          <div>
+            <div className="card-icon"><Users size={17}/></div>
+            <div><h2>Developers</h2><p>Everyone with a seat, and the access code that let them in.</p></div>
+          </div>
+          <button className="secondary-button" onClick={()=>setShowCodes(v=>!v)}>
+            {showCodes ? <><EyeOff size={14}/>Hide codes</> : <><Eye size={14}/>Show codes</>}
+          </button>
+        </div>
+
+        {users.length === 0
+          ? <div className="admin-empty">Nobody has registered yet.</div>
+          : <div className="code-list">{users.map(user=><div key={user.id} className="code-row">
+              <div className="code-main">
+                <div className="code-id">
+                  <strong className="user-name">{user.name}</strong>
+                  <span className="code-for"><Mail size={11}/>{user.email}</span>
+                  {user.isAdmin && <span className="status-pill admin">Admin</span>}
+                </div>
+                <div className="code-meta">
+                  <span title={ADMITTED_NOTE[user.admittedBy]}>{ADMITTED_TEXT[user.admittedBy]}</span>
+                  <span>Joined {shortDate(user.createdAt)}</span>
+                  {user.lastLoginAt && <span>Last signed in {shortDate(user.lastLoginAt)}</span>}
+                  {user.accessCode?.label && <span>{user.accessCode.label}</span>}
+                </div>
+              </div>
+              <div className="code-actions user-code">
+                {user.accessCode
+                  ? codeCell(user.accessCode)
+                  : <span className="code-none" title={ADMITTED_NOTE[user.admittedBy]}>No issued code</span>}
+              </div>
+            </div>)}</div>}
+      </section>
+
+      {/* ---- Issued codes ------------------------------------------------ */}
+      <section className="card span-2">
+        <div className="card-head">
           <div>
             <div className="card-icon"><ShieldCheck size={17}/></div>
             <div><h2>Issued codes</h2><p>Withdraw a code to refuse it from now on. A used code stays here as the record of who was let in.</p></div>
           </div>
+          <button className="secondary-button" onClick={()=>setShowCodes(v=>!v)}>
+            {showCodes ? <><EyeOff size={14}/>Hide codes</> : <><Eye size={14}/>Show codes</>}
+          </button>
         </div>
 
         {codes.length === 0
@@ -1403,7 +1505,7 @@ function AdminPage() {
           : <div className="code-list">{codes.map(entry=><div key={entry.id} className="code-row">
               <div className="code-main">
                 <div className="code-id">
-                  <code>{revealed[entry.id] || entry.hint}</code>
+                  {codeCell(entry)}
                   <span className={`status-pill ${entry.status}`}>{STATUS_TEXT[entry.status]}</span>
                   {entry.assignedEmail && <span className="code-for"><Mail size={11}/>{entry.assignedEmail}</span>}
                 </div>
@@ -1417,13 +1519,8 @@ function AdminPage() {
                 </div>
               </div>
               <div className="code-actions">
-                {revealed[entry.id]
-                  ? <>
-                      <CopyButton value={revealed[entry.id]} small/>
-                      <button className="icon-button small" title="Hide the code"
-                        onClick={()=>setRevealed(r=>{ const next={...r}; delete next[entry.id]; return next; })}><EyeOff size={14}/></button>
-                    </>
-                  : <button className="icon-button small" title="Reveal the code" onClick={()=>reveal(entry)}><Eye size={14}/></button>}
+                {entry.readable && entry.status==='active' && <button className="icon-button small" title="Copy the message to send"
+                  onClick={()=>navigator.clipboard.writeText(inviteMessage(entry.code as string,entry))}><Mail size={14}/></button>}
                 {entry.status!=='revoked' && <button className="icon-button small" title="Withdraw this code" onClick={()=>revoke(entry)}><Ban size={14}/></button>}
                 <button className="icon-button small" title="Delete this code" onClick={()=>remove(entry)}><Trash2 size={14}/></button>
               </div>

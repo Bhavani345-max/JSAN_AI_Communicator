@@ -146,7 +146,36 @@ CREATE TABLE IF NOT EXISTS jsan_access_codes (
 CREATE INDEX IF NOT EXISTS jsan_access_codes_created_idx
   ON jsan_access_codes(created_at DESC);
 
+-- Which code let which developer in.
+--
+-- jsan_access_codes carries last_used_by, which answers the question only for a
+-- code used once. A code an admin cut for a pair or a whole squad is used
+-- several times and keeps only the most recent address, so "show me the access
+-- code for this developer" could not be answered from it. One row per
+-- redemption can.
+--
+-- CASCADE from the code rather than SET NULL: deleting a code is the admin
+-- saying they want no record of it, and a redemption pointing at a code that no
+-- longer exists would be a row nothing could explain. The user reference is
+-- SET NULL instead, so removing a developer's account leaves the history of
+-- which code was spent, and on what address, intact.
+CREATE TABLE IF NOT EXISTS jsan_access_code_redemptions (
+  id          TEXT PRIMARY KEY,
+  code_id     TEXT NOT NULL REFERENCES jsan_access_codes(id) ON DELETE CASCADE,
+  user_id     TEXT REFERENCES jsan_users(id) ON DELETE SET NULL,
+  -- Kept beside user_id, not derived from it, for the same reason above.
+  email       TEXT NOT NULL COLLATE NOCASE,
+  redeemed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS jsan_access_code_redemptions_code_idx
+  ON jsan_access_code_redemptions(code_id);
+
+-- The admin users list joins on this to name each developer's code.
+CREATE INDEX IF NOT EXISTS jsan_access_code_redemptions_user_idx
+  ON jsan_access_code_redemptions(user_id);
+
 -- Updated rather than left alone, so a database created before the image table
 -- existed reports the version it has actually been migrated to.
-INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '4')
+INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '5')
   ON CONFLICT(key) DO UPDATE SET value = excluded.value;

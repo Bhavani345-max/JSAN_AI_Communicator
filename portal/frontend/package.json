@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "icons": "node scripts/icons.mjs",
     "dev": "vite --host 0.0.0.0",
     "typecheck": "tsc --noEmit"
   },

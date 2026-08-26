@@ -478,11 +478,29 @@ function accessCodeStatus(row, now = Date.now()) {
   return 'active';
 }
 
-/** The admin page's view of a code. Never carries the code itself. */
+/**
+ * The admin page's view of a code, the plaintext code included.
+ *
+ * An admin has to be able to answer "what is this developer's code?" months
+ * after issuing it - somebody loses the email, or joins a call asking to be let
+ * in again - so the code is decrypted for every row rather than one at a time
+ * behind a button. That is only ever sent to a signed-in admin, and the page
+ * has a control to blank them all out for screen sharing.
+ *
+ * `code` is null and `readable` false where the row cannot be decrypted, which
+ * in practice means KEY_ENCRYPTION_SECRET was rotated after it was issued. The
+ * code still works for whoever holds it - registration matches on the hash,
+ * which is untouched - so this is reported rather than treated as a failure.
+ */
 function serializeAccessCode(row) {
   const status = accessCodeStatus(row);
+  let code = null;
+  try { code = decryptText({ ciphertext: row.code_ciphertext, iv: row.code_iv, tag: row.code_tag }); }
+  catch { code = null; }
   return {
     id: row.id,
+    code,
+    readable: code !== null,
     hint: row.code_hint,
     label: row.label || '',
     assignedEmail: row.assigned_email || null,
@@ -896,6 +914,18 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
       db.prepare(`INSERT INTO jsan_users(id,name,email,password_hash,litellm_user_id,litellm_key_ciphertext,litellm_key_iv,litellm_key_tag,last_login_at)
         VALUES(?,?,?,?,?,?,?,?,?)`)
         .run(id, name, email, passwordHash, provision.litellmUserId, encrypted.ciphertext, encrypted.iv, encrypted.tag, nowIso());
+      // One row per redemption, beside the running count on the code itself.
+      // The count says how much of a code is spent; this says by whom, which is
+      // the only way to answer "what is this developer's code?" for a code an
+      // admin cut for more than one person.
+      //
+      // After the user row, not before: it points at jsan_users(id), and SQLite
+      // checks a foreign key as the statement runs rather than at COMMIT, so
+      // the other order fails the whole registration.
+      if (admitted.code) {
+        db.prepare('INSERT INTO jsan_access_code_redemptions(id,code_id,user_id,email) VALUES(?,?,?,?)')
+          .run(crypto.randomUUID(), admitted.code.id, id, email);
+      }
     });
   } catch (e) {
     await revokeLiteLLMUser(provision);
@@ -1045,9 +1075,10 @@ app.post('/api/me/api-key/rotate', auth, async (req, res) => {
 // account this process just loaded rather than a claim in the cookie, so an
 // address dropped from ADMIN_EMAILS loses these routes on its next request.
 //
-// Nothing in this section returns a code except /reveal and the response that
-// creates one: the list is deliberately hint-only, so a screen share of the
-// Admin page does not hand out anybody's seat.
+// These routes do return codes in plaintext, and that is the point: an admin
+// has to be able to answer "what is my code?" for any developer at any time,
+// which a write-only store cannot do. What guards them is the gate above, not
+// obscurity - and the page itself can blank every code on screen for a share.
 // ---------------------------------------------------------------------------
 
 const LIST_CODES = `SELECT c.*, u.email AS created_by_email
@@ -1072,6 +1103,10 @@ app.get('/api/admin/overview', auth, adminOnly, adminLimiter, (_req, res) => {
     registrationOpen: count < MAX_USERS,
     activeCodes: active,
     totalCodes: codes.length,
+    // Seats already promised to somebody holding a code they have not spent.
+    // Shown beside the seat count so an admin can see the portal running out
+    // before a developer is the one to discover it.
+    outstandingCodeUses: outstandingCodeUses(),
     emailDomain: ALLOWED_EMAIL_DOMAIN || null,
     // Whether the old team-wide code is still accepted beside issued ones. The
     // code itself is never sent - only whether one is configured, so an admin
@@ -1086,27 +1121,99 @@ app.get('/api/admin/access-codes', auth, adminOnly, adminLimiter, (_req, res) =>
   res.json({ codes: db.prepare(LIST_CODES).all().map(serializeAccessCode) });
 });
 
+// How many addresses one submission may carry. Past this the form is being
+// used as a mailing list, and a slip would mint dozens of live codes at once.
+const CODE_BULK_LIMIT = 50;
+
+/**
+ * The addresses a submission is asking for codes for.
+ *
+ * Liberal in what it accepts, because an admin onboarding a team is pasting
+ * from somewhere else: an array from the form, or one string with the
+ * addresses separated by newlines, commas, semicolons or spaces - which is
+ * what a column out of a spreadsheet or an email's To: line gives you.
+ * Lowercased and de-duplicated, so the same person listed twice gets one code
+ * rather than two, and an empty list means one code bound to nobody.
+ */
+function readAssignedEmails(body) {
+  const parts = [];
+  const collect = (value) => {
+    if (Array.isArray(value)) value.forEach(collect);
+    else if (typeof value === 'string') parts.push(...value.split(/[,;\s]+/));
+  };
+  collect(body?.assignedEmails);
+  collect(body?.assignedEmail);
+  const seen = new Set();
+  const emails = [];
+  for (const part of parts) {
+    const email = part.trim().toLowerCase();
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+    emails.push(email);
+  }
+  return emails;
+}
+
+/**
+ * Why this address cannot be given a code, or null when it can.
+ *
+ * Returned per address rather than thrown, because one bad line in a pasted
+ * list must not cost the admin the other nineteen: the route reports what it
+ * skipped and issues the rest.
+ */
+function assignedEmailProblem(email) {
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'Not a valid email address';
+  if (ALLOWED_EMAIL_DOMAIN && !email.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) {
+    return `Registration only accepts ${ALLOWED_EMAIL_DOMAIN} addresses`;
+  }
+  if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email)) return 'Already has an account';
+  // A second live code for one person is almost always the form submitted
+  // twice rather than a deliberate reissue, and both would work - leaving a
+  // spare seat nobody is tracking. Withdrawing the first is the explicit way
+  // to replace it.
+  const held = db.prepare('SELECT expires_at,revoked_at,uses,max_uses FROM jsan_access_codes WHERE assigned_email=?').all(email);
+  if (held.some(row => accessCodeStatus(row) === 'active')) {
+    return 'Already holds an unused code - withdraw it first to issue another';
+  }
+  return null;
+}
+
+/** Write one code. Returns its id and plaintext; the row is read back after. */
+function insertAccessCode({ assignedEmail, label, maxUses, expiresAt, createdBy }) {
+  const id = crypto.randomUUID();
+  const code = newAccessCode();
+  const encrypted = encryptText(code);
+  db.prepare(`INSERT INTO jsan_access_codes(id,code_hash,code_ciphertext,code_iv,code_tag,code_hint,label,assigned_email,max_uses,expires_at,created_by)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, accessCodeDigest(code), encrypted.ciphertext, encrypted.iv, encrypted.tag,
+         accessCodeHint(code), label, assignedEmail, maxUses, expiresAt, createdBy);
+  return { id, code };
+}
+
+/** Unused seats promised by codes that have been issued but not spent. */
+function outstandingCodeUses() {
+  return db.prepare('SELECT expires_at,revoked_at,uses,max_uses FROM jsan_access_codes').all()
+    .filter(row => accessCodeStatus(row) === 'active')
+    .reduce((total, row) => total + (row.max_uses - row.uses), 0);
+}
+
+/**
+ * Issue codes - one for nobody in particular, or one each for a list of
+ * developers in a single submission.
+ *
+ * The limits (how many uses, when it lapses) apply to the whole submission and
+ * are rejected rather than clamped, because a form that silently turned "3o"
+ * into a code that never expires would be worse than one that says no. The
+ * addresses are judged one at a time and reported back in two lists, so
+ * onboarding twenty people does not stop at the one who already has an account.
+ */
 app.post('/api/admin/access-codes', auth, adminOnly, adminLimiter, (req, res) => {
   const label = String(req.body?.label || '').trim().slice(0, 80);
-  const assignedEmail = String(req.body?.assignedEmail || '').trim().toLowerCase();
-
-  if (assignedEmail) {
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(assignedEmail)) {
-      return res.status(400).json({ error: 'Enter a valid email for the developer, or leave it blank' });
-    }
-    // Refused here rather than at registration: a code bound to an address the
-    // domain rule will reject is a code that can never be spent, and the person
-    // it was handed to would be the one to find that out.
-    if (ALLOWED_EMAIL_DOMAIN && !assignedEmail.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) {
-      return res.status(400).json({ error: `Registration only accepts ${ALLOWED_EMAIL_DOMAIN} addresses, so this code could never be used` });
-    }
-    if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(assignedEmail)) {
-      return res.status(409).json({ error: 'That developer already has an account' });
-    }
+  const emails = readAssignedEmails(req.body);
+  if (emails.length > CODE_BULK_LIMIT) {
+    return res.status(400).json({ error: `That is ${emails.length} addresses. Issue at most ${CODE_BULK_LIMIT} codes at a time.` });
   }
 
-  // Both bounds reject rather than clamp. A form that silently turned "3o" into
-  // a code that never expires would be worse than one that says no.
   const rawUses = req.body?.maxUses;
   const maxUses = rawUses === undefined || rawUses === null || rawUses === '' ? 1 : Number(rawUses);
   if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > CODE_MAX_USES_LIMIT) {
@@ -1119,38 +1226,98 @@ app.post('/api/admin/access-codes', auth, adminOnly, adminLimiter, (req, res) =>
   }
   const expiresAt = days > 0 ? new Date(Date.now() + days * 86_400_000).toISOString() : null;
 
-  // The plaintext is returned once here and kept encrypted in the row, so the
-  // admin can read it back later from /reveal rather than having to issue a
-  // second code because they closed the tab before copying the first.
-  const id = crypto.randomUUID();
-  const code = newAccessCode();
-  const encrypted = encryptText(code);
+  // An empty list is one code bound to nobody, which is what the form does
+  // when the addresses box is left blank.
+  const targets = emails.length ? emails : [null];
+  const issued = [], skipped = [];
   try {
-    db.prepare(`INSERT INTO jsan_access_codes(id,code_hash,code_ciphertext,code_iv,code_tag,code_hint,label,assigned_email,max_uses,expires_at,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, accessCodeDigest(code), encrypted.ciphertext, encrypted.iv, encrypted.tag,
-           accessCodeHint(code), label, assignedEmail || null, maxUses, expiresAt, req.user.id);
+    // One transaction for the whole submission. BEGIN IMMEDIATE holds the write
+    // lock across it, so "does this address already have an account, or a live
+    // code?" cannot be answered from a state that a concurrent registration or
+    // a second admin changes underneath it. All-or-nothing as well: a batch
+    // that fails half way leaves no codes to reconcile against the list the
+    // admin thinks they sent.
+    transaction(db, () => {
+      for (const email of targets) {
+        const problem = email ? assignedEmailProblem(email) : null;
+        if (problem) { skipped.push({ email, error: problem }); continue; }
+        const written = insertAccessCode({ assignedEmail: email, label, maxUses, expiresAt, createdBy: req.user.id });
+        issued.push({ email, ...written });
+      }
+    });
   } catch (e) {
-    console.error('Could not issue an access code:', e.message);
-    return res.status(500).json({ error: 'Could not issue the access code. Try again.' });
+    console.error('Could not issue access codes:', e.message);
+    return res.status(500).json({ error: 'Could not issue the access codes. Nothing was created - try again.' });
   }
 
-  console.log(`Access code ${accessCodeHint(code)} issued by ${req.user.email}${assignedEmail ? ` for ${assignedEmail}` : ''}`);
-  res.status(201).json({ code, entry: serializeAccessCode(accessCodeById(id)) });
+  const entries = issued.map(item => ({
+    email: item.email,
+    code: item.code,
+    entry: serializeAccessCode(accessCodeById(item.id))
+  }));
+  for (const item of issued) {
+    console.log(`Access code ${accessCodeHint(item.code)} issued by ${req.user.email}${item.email ? ` for ${item.email}` : ''}`);
+  }
+
+  // Said rather than enforced: a code is often cut before the seat is needed,
+  // and refusing to issue one would be the wrong call. Registration still
+  // stops at MAX_USERS, so without this the admin would find out by way of a
+  // developer being turned away.
+  const registered = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get().count;
+  const outstanding = outstandingCodeUses();
+  const warning = registered + outstanding > MAX_USERS
+    ? `${registered} of ${MAX_USERS} seats are taken and ${outstanding} unused code uses are outstanding. Whoever arrives after the last seat will be refused.`
+    : null;
+
+  res.status(entries.length ? 201 : 200).json({
+    issued: entries,
+    skipped,
+    warning,
+    // The single-code shape this route has always answered with, kept so a
+    // caller that asked for one code does not have to read a list to find it.
+    code: entries[0]?.code ?? null,
+    entry: entries[0]?.entry ?? null
+  });
 });
 
-app.get('/api/admin/access-codes/:id/reveal', auth, adminOnly, adminLimiter, (req, res) => {
-  const row = db.prepare('SELECT * FROM jsan_access_codes WHERE id=?').get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'That access code no longer exists' });
-  try {
-    res.json({ code: decryptText({ ciphertext: row.code_ciphertext, iv: row.code_iv, tag: row.code_tag }) });
-  } catch {
-    // The only realistic cause is KEY_ENCRYPTION_SECRET having been rotated
-    // since the code was issued, which is the same thing that makes a stored
-    // LiteLLM key unreadable. The code itself still works for whoever holds it,
-    // since the hash is untouched - it just cannot be read back here.
-    res.status(500).json({ error: 'This code cannot be read back, because the encryption secret changed after it was issued. Revoke it and issue a new one.' });
+/**
+ * Every developer, and the code that let them in.
+ *
+ * The join runs through jsan_access_code_redemptions rather than the counter on
+ * the code, so it stays right for a code an admin cut for several people. An
+ * account with no redemption behind it was either declared in SEED_ACCOUNTS or
+ * registered on the shared REGISTRATION_ACCESS_CODE - including anyone who
+ * signed up before codes could be issued at all - and is labelled accordingly
+ * rather than shown as having no way in.
+ */
+app.get('/api/admin/users', auth, adminOnly, adminLimiter, (_req, res) => {
+  const seeded = new Set(SEED_ACCOUNTS.map(account => account.email));
+  const users = db.prepare('SELECT id,name,email,created_at,last_login_at FROM jsan_users ORDER BY created_at DESC LIMIT 200').all();
+  const byUser = new Map();
+  for (const row of db.prepare(`SELECT r.user_id, r.redeemed_at, c.*, a.email AS created_by_email
+      FROM jsan_access_code_redemptions r
+      JOIN jsan_access_codes c ON c.id = r.code_id
+      LEFT JOIN jsan_users a ON a.id = c.created_by
+      WHERE r.user_id IS NOT NULL`).all()) {
+    byUser.set(row.user_id, row);
   }
+  res.json({
+    users: users.map(user => {
+      const redemption = byUser.get(user.id);
+      const address = String(user.email).toLowerCase();
+      return {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        createdAt: user.created_at,
+        lastLoginAt: user.last_login_at,
+        isAdmin: ADMIN_EMAILS.has(address),
+        admittedBy: redemption ? 'issued-code' : (seeded.has(address) ? 'seed-account' : 'shared-code'),
+        redeemedAt: redemption?.redeemed_at || null,
+        accessCode: redemption ? serializeAccessCode(redemption) : null
+      };
+    })
+  });
 });
 
 app.post('/api/admin/access-codes/:id/revoke', auth, adminOnly, adminLimiter, (req, res) => {
