@@ -428,3 +428,58 @@
 /* Long formulas scroll inside their own line instead of widening the thread. */
 .markdown .katex{font-size:1.04em}
 .markdown .katex-display{overflow-x:auto;overflow-y:hidden;padding:3px 0;margin:0 0 11px}
+
+/* ---------------------------------------------------------------------------
+   Admin: team access codes
+   ------------------------------------------------------------------------ */
+.admin-form{margin-top:18px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}
+.admin-form label{display:grid;gap:7px;font-size:10px;font-weight:700;color:var(--muted);align-content:start}
+.admin-form .label-text{display:flex;align-items:baseline;gap:6px;min-width:0}
+.admin-form .label-text i{font-style:normal;font-weight:600;font-size:9px;opacity:.65}
+.admin-form input,.admin-form select{height:39px;border:1px solid var(--line2);border-radius:9px;padding:0 11px;background:var(--panel);font-size:11px;outline:0;color:var(--text)}
+.admin-form input:focus,.admin-form select:focus{border-color:#8c9cf6;box-shadow:0 0 0 3px rgba(53,88,232,.09)}
+.admin-form input:disabled,.admin-form select:disabled{opacity:.55}
+.full-row{grid-column:1/-1}
+.admin-submit{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.admin-hint{font-size:9px;color:var(--muted)}
+
+/* The one place a freshly issued code is shown in full. */
+.issued-code{margin-top:18px;border:1px solid var(--accent);border-radius:13px;background:color-mix(in srgb,var(--soft) 60%,var(--panel));padding:17px}
+.issued-code>strong{display:block;font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:800}
+.issued-code .code-value{margin-top:11px;display:flex;align-items:center;gap:9px;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:11px 9px 11px 13px}
+.issued-code .code-value code{flex:1;min-width:0;font-size:16px;font-weight:750;letter-spacing:.05em;overflow:auto;white-space:nowrap}
+.issued-code>p{font-size:9px;color:var(--muted);margin:11px 0 0;line-height:1.55}
+.issued-actions{margin-top:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+
+.admin-note{margin-top:16px;display:flex;gap:9px;align-items:flex-start;border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:11px 12px}
+.admin-note svg{flex:none;margin-top:1px;color:var(--muted)}
+.admin-note p{margin:0;font-size:9px;color:var(--muted);line-height:1.6}
+.admin-note code{font-size:9px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 4px}
+
+.admin-empty{margin-top:16px;border:1px dashed var(--line2);border-radius:11px;padding:22px;text-align:center;font-size:10px;color:var(--muted)}
+
+.code-list{margin-top:16px;display:grid;gap:8px}
+.code-row{border:1px solid var(--line);border-radius:11px;background:var(--panel2);padding:12px 12px 12px 14px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center}
+.code-main{min-width:0}
+.code-id{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.code-id code{font-size:11px;font-weight:750;letter-spacing:.03em}
+.code-for{display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--muted)}
+.code-meta{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px 14px;font-size:9px;color:var(--muted)}
+.code-actions{display:flex;align-items:center;gap:3px}
+
+.status-pill{font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;border-radius:999px;padding:3px 8px;border:1px solid var(--line2);background:var(--panel);color:var(--muted)}
+.status-pill.active{color:#1f7a4d;background:#eaf7f0;border-color:#c3e4d3}
+.status-pill.used{color:#3a5488;background:#eef2fb;border-color:#ccd8ef}
+.status-pill.expired,.status-pill.revoked{color:#aa3a32;background:#fff4f2;border-color:#f1d0cc}
+
+.field-note{font-size:9px;font-weight:600;color:var(--muted);line-height:1.5}
+
+[data-theme="dark"] .status-pill.active{color:#7fd8ab;background:#132a20;border-color:#255140}
+[data-theme="dark"] .status-pill.used{color:#9ab4f0;background:#161f34;border-color:#2b3a5c}
+[data-theme="dark"] .status-pill.expired,[data-theme="dark"] .status-pill.revoked{color:#f0968c;background:#2a1614;border-color:#4a2723}
+
+@media (max-width:900px){
+  .admin-form{grid-template-columns:minmax(0,1fr)}
+  .code-row{grid-template-columns:minmax(0,1fr)}
+  .code-actions{justify-content:flex-end}
+}

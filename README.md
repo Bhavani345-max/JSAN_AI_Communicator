@@ -37,10 +37,19 @@ base64. Answers render each code block with its own download control. Read the
 free-tier request ceiling in `RAILWAY_DEPLOYMENT_GUIDE.md` before putting a team
 on this.
 
-Anyone with the team access code can register from the sign-in screen, which
-asks for a username, work email, and the password twice. Three wrong passwords
-lock that address for 30 minutes; the count lives in the database rather than in
-process memory, so restarting the portal does not hand the allowance back.
+Registering from the sign-in screen asks for a username, work email, the
+password twice, and a team access code. An account listed in `ADMIN_EMAILS`
+gets an Admin page, and generates those codes one at a time: name the developer
+the code is for and only that address can spend it, set how many times it may
+be used and when it lapses, then copy the ready-written message and send it to
+them. A code is shown in full when it is generated and again on Reveal — the
+list itself carries only a hint, so the page can be on screen in a meeting.
+Withdrawing a code refuses it from that moment on without touching anybody
+else's, which the single shared `REGISTRATION_ACCESS_CODE` could never do; that
+variable still works where it is set, and leaving it unset makes issued codes
+the only way in. Three wrong passwords lock that address for 30 minutes; the
+count lives in the database rather than in process memory, so restarting the
+portal does not hand the allowance back.
 
 One developer may have two model calls running at once — `/api/chat`,
 `/api/documents` and `/v1` draw on the same allowance, and the third simultaneous

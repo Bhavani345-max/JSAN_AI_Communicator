@@ -7,12 +7,16 @@ import {
   Menu, MessageSquarePlus, Moon, Paperclip, RotateCcw, Search, Sparkles, Square,
   Sun, Terminal, Trash2, Wrench, X, Zap, BrainCircuit, Bug, GitPullRequest,
   Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2, Lock, TriangleAlert,
-  Presentation, FileUp, LoaderCircle, Palette
+  Presentation, FileUp, LoaderCircle, Palette, Ticket, Plus, Ban, Eye, EyeOff,
+  Mail, Info
 } from 'lucide-react';
 import 'highlight.js/styles/github-dark.css';
 import './styles.css';
 
-type User = { id:string; name:string; email:string };
+// isAdmin is decided by the server from ADMIN_EMAILS and arrives with every
+// /api/me, so it cannot be set from the browser. It only decides whether the
+// Admin nav entry is drawn - the routes behind it check for themselves.
+type User = { id:string; name:string; email:string; isAdmin?:boolean };
 type Conv = { id:string; title:string; mode:string; updated_at:string };
 /** An image already sent. `url` is a data URL while the turn is live, and
  *  /api/images/:id once the conversation is reloaded from the server. */
@@ -564,7 +568,10 @@ function Auth({onReady}:{onReady:(u:User)=>void}) {
             <input autoComplete="new-password" type="password" className={mismatch?'mismatch':''} value={form.confirmPassword} onChange={e=>set({confirmPassword:e.target.value})} placeholder="Type the same password again" required/>
             {mismatch && <small className="field-hint">Both passwords must match.</small>}
           </label>}
-          {tab==='register' && <label>Team access code<input value={form.accessCode} onChange={e=>set({accessCode:e.target.value})} placeholder="Code shared by your team" required/></label>}
+          {tab==='register' && <label>Team access code
+            <input value={form.accessCode} onChange={e=>set({accessCode:e.target.value})} placeholder="JSAN-XXXXX-XXXXX-XXXXX" required/>
+            <small className="field-note">Your JSAN admin generates this for your email address and sends it to you. Most codes work once, for the address they were issued to.</small>
+          </label>}
           {error && <div className="form-error">{error}</div>}
           {locked && <div className="form-error">Locked after {status?.maxAttempts ?? 3} failed attempts. You can try again in {clock(secondsLeft)}.</div>}
           <button className="primary-button full" disabled={busy||locked||mismatch}>{submitLabel}</button>
@@ -578,7 +585,7 @@ function Auth({onReady}:{onReady:(u:User)=>void}) {
 function App() {
   const [user,setUser] = useState<User|null>(null);
   const [loading,setLoading] = useState(true);
-  const [page,setPage] = useState<'chat'|'slides'|'tools'|'usage'>('chat');
+  const [page,setPage] = useState<'chat'|'slides'|'tools'|'usage'|'admin'>('chat');
   const [mobileNav,setMobileNav] = useState(false);
   // Bumping this tells an already-mounted Chat to clear itself. It lives here
   // rather than in Chat because the shortcut and the button must work from
@@ -610,6 +617,7 @@ function App() {
         <button className={page==='slides'?'active':''} onClick={()=>{setPage('slides');setMobileNav(false)}}><Presentation size={16}/><span>Slides</span></button>
         <button className={page==='tools'?'active':''} onClick={()=>{setPage('tools');setMobileNav(false)}}><Terminal size={16}/><span>Tools</span></button>
         <button className={page==='usage'?'active':''} onClick={()=>{setPage('usage');setMobileNav(false)}}><Gauge size={16}/><span>Usage</span></button>
+        {user.isAdmin && <button className={page==='admin'?'active':''} onClick={()=>{setPage('admin');setMobileNav(false)}}><ShieldCheck size={16}/><span>Admin</span></button>}
       </nav>
       <div className="sidebar-spacer"/>
       <div className="sidebar-foot">
@@ -627,6 +635,7 @@ function App() {
       {page==='slides' && <SlidesPage/>}
       {page==='tools' && <Tools/>}
       {page==='usage' && <UsagePage/>}
+      {page==='admin' && user.isAdmin && <AdminPage/>}
     </main>
   </div>;
 }
@@ -1165,6 +1174,262 @@ function SlidesPage() {
         </div>}
       </section>}
     </div>
+  </div>;
+}
+
+/** One issued team access code, as the admin list reports it. The code itself
+ *  is never in here — only a hint — until Reveal asks for it by id. */
+type AccessCode = {
+  id:string; hint:string; label:string; assignedEmail:string|null;
+  maxUses:number; uses:number; remaining:number;
+  status:'active'|'used'|'expired'|'revoked';
+  createdAt:string; expiresAt:string|null; revokedAt:string|null;
+  lastUsedAt:string|null; lastUsedBy:string|null; createdByEmail:string|null;
+};
+type AdminOverview = {
+  registeredUsers:number; maxUsers:number; seatsRemaining:number; registrationOpen:boolean;
+  activeCodes:number; totalCodes:number; emailDomain:string|null; sharedCodeEnabled:boolean;
+  admins:string[]; limits:{defaultExpiryDays:number; maxUses:number; maxExpiryDays:number};
+};
+
+const EXPIRY_CHOICES = [
+  {value:'1', label:'1 day'},
+  {value:'7', label:'7 days'},
+  {value:'14', label:'14 days'},
+  {value:'30', label:'30 days'},
+  {value:'90', label:'90 days'},
+  {value:'0', label:'Never expires'}
+];
+
+const STATUS_TEXT:Record<AccessCode['status'],string> = {
+  active:'Ready to send', used:'Used', expired:'Expired', revoked:'Withdrawn'
+};
+
+const shortDate = (iso:string|null) =>
+  iso ? new Date(iso).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}) : '';
+
+/**
+ * The message an admin sends to one developer.
+ *
+ * Built here rather than left to the admin to write, because the code alone is
+ * not enough to act on: the person also needs the address it is bound to and
+ * the fact that forwarding it will not work. One copy, one paste, nothing for
+ * the admin to get wrong on the twentieth invitation.
+ */
+function inviteMessage(code:string, entry:AccessCode) {
+  const timesUsed = entry.maxUses === 1 ? 'once' : `${entry.maxUses} times`;
+  return [
+    'You have a seat on JSAN Dev AI.',
+    '',
+    `1. Open ${window.location.origin}`,
+    '2. Choose Register',
+    `3. Sign up with ${entry.assignedEmail || 'your work email'} and this team access code:`,
+    '',
+    `   ${code}`,
+    '',
+    entry.expiresAt
+      ? `It works until ${shortDate(entry.expiresAt)} and can be used ${timesUsed}.`
+      : `It can be used ${timesUsed}.`,
+    'Please do not forward it — it was issued to you.'
+  ].join('\n');
+}
+
+/**
+ * Admin: issue a team access code to one developer.
+ *
+ * Only mounted for an account in ADMIN_EMAILS, and every route it calls checks
+ * that again server-side — the hidden nav entry is a convenience, not the
+ * control. A code is shown in full exactly twice: in the panel that appears
+ * when it is generated, and when Reveal is pressed for it. The list itself
+ * carries hints, so this page can be on screen in a meeting without handing
+ * anybody a seat.
+ */
+function AdminPage() {
+  const [overview,setOverview] = useState<AdminOverview|null>(null);
+  const [codes,setCodes] = useState<AccessCode[]>([]);
+  const [form,setForm] = useState({assignedEmail:'',label:'',maxUses:'1',expiresInDays:'14'});
+  const [issued,setIssued] = useState<{code:string;entry:AccessCode}|null>(null);
+  // Codes read back from /reveal, kept per id so several can be open at once.
+  const [revealed,setRevealed] = useState<Record<string,string>>({});
+  const [busy,setBusy] = useState(false);
+  const [error,setError] = useState('');
+  const [loading,setLoading] = useState(true);
+
+  const load = useCallback(async()=>{
+    try {
+      const [summary,list] = await Promise.all([api('/api/admin/overview'),api('/api/admin/access-codes')]);
+      setOverview(summary); setCodes(list.codes);
+    } catch(e:any){ setError(e.message); }
+    finally { setLoading(false); }
+  },[]);
+  useEffect(()=>{ load(); },[load]);
+
+  const set = (patch:Partial<typeof form>)=>setForm(f=>({...f,...patch}));
+
+  const generate = async(e:React.FormEvent)=>{
+    e.preventDefault();
+    setBusy(true); setError(''); setIssued(null);
+    try {
+      const data = await api('/api/admin/access-codes',{method:'POST',body:JSON.stringify({
+        assignedEmail: form.assignedEmail.trim(),
+        label: form.label.trim(),
+        maxUses: Number(form.maxUses),
+        expiresInDays: Number(form.expiresInDays)
+      })});
+      setIssued(data);
+      // The email and note belong to the person it was just cut for; the limits
+      // are the admin's working defaults and are left where they set them.
+      setForm(f=>({...f,assignedEmail:'',label:''}));
+      load();
+    } catch(e:any){ setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const reveal = async(entry:AccessCode)=>{
+    setError('');
+    try {
+      const data = await api(`/api/admin/access-codes/${entry.id}/reveal`);
+      setRevealed(r=>({...r,[entry.id]:data.code}));
+    } catch(e:any){ setError(e.message); }
+  };
+
+  const revoke = async(entry:AccessCode)=>{
+    if(!confirm(`Withdraw ${entry.hint}? Anyone still holding it will be refused at registration.`)) return;
+    setError('');
+    try { await api(`/api/admin/access-codes/${entry.id}/revoke`,{method:'POST'}); await load(); }
+    catch(e:any){ setError(e.message); }
+  };
+
+  const remove = async(entry:AccessCode)=>{
+    if(!confirm(`Delete ${entry.hint} from the list? Withdrawing it is usually better — deleting also removes the record of who used it.`)) return;
+    setError('');
+    try {
+      await api(`/api/admin/access-codes/${entry.id}`,{method:'DELETE'});
+      setRevealed(r=>{ const next={...r}; delete next[entry.id]; return next; });
+      if(issued?.entry.id===entry.id) setIssued(null);
+      await load();
+    } catch(e:any){ setError(e.message); }
+  };
+
+  const domain = overview?.emailDomain;
+
+  return <div className="page">
+    <header className="page-header">
+      <div>
+        <span className="eyebrow">Admin</span>
+        <h1>Give one developer one seat.</h1>
+        <p>Generate a team access code, send it to the person it is for, and it stops working the moment they have used it.</p>
+      </div>
+      {overview && <div className="header-badge">
+        <span/><strong>{overview.registeredUsers} of {overview.maxUsers} seats used</strong>
+      </div>}
+    </header>
+
+    {error && <div className="page-error">{error}</div>}
+
+    {loading ? <div className="skeleton"/> : <div className="content-grid">
+      <section className="metric-card"><span>Developers registered</span><strong>{overview?.registeredUsers ?? 0}</strong><small>{overview?.registrationOpen ? 'Registration is open' : 'Every seat is taken'}</small></section>
+      <section className="metric-card"><span>Seats remaining</span><strong>{overview?.seatsRemaining ?? 0}</strong><small>Of {overview?.maxUsers ?? 0} configured</small></section>
+      <section className="metric-card"><span>Codes ready to send</span><strong>{overview?.activeCodes ?? 0}</strong><small>{overview?.totalCodes ?? 0} issued in total</small></section>
+      <section className="metric-card"><span>Admins</span><strong>{overview?.admins.length ?? 0}</strong><small>Set by ADMIN_EMAILS</small></section>
+
+      <section className="card span-2">
+        <div className="card-head simple">
+          <div>
+            <div className="card-icon"><Ticket size={17}/></div>
+            <div><h2>Generate a team access code</h2><p>Leave the email blank for a code anyone on the team may use, or name one developer so nobody else can spend it.</p></div>
+          </div>
+        </div>
+
+        <form className="admin-form" onSubmit={generate}>
+          <label>
+            <span className="label-text">Developer email <i>optional</i></span>
+            <input type="email" value={form.assignedEmail} onChange={e=>set({assignedEmail:e.target.value})}
+              placeholder={`name@${domain || 'yourcompany.com'}`} disabled={busy}/>
+          </label>
+          <label>
+            <span className="label-text">Note <i>optional</i></span>
+            <input value={form.label} onChange={e=>set({label:e.target.value})} maxLength={80}
+              placeholder="Who it is for, or which team" disabled={busy}/>
+          </label>
+          <label>
+            <span className="label-text">How many times it may be used</span>
+            <input type="number" min={1} max={overview?.limits.maxUses ?? 20} value={form.maxUses}
+              onChange={e=>set({maxUses:e.target.value})} disabled={busy}/>
+          </label>
+          <label>
+            <span className="label-text">Expires</span>
+            <select value={form.expiresInDays} onChange={e=>set({expiresInDays:e.target.value})} disabled={busy}>
+              {EXPIRY_CHOICES.map(choice=><option key={choice.value} value={choice.value}>{choice.label}</option>)}
+            </select>
+          </label>
+          <div className="full-row admin-submit">
+            <button className="primary-button" disabled={busy}><Plus size={14}/>{busy?'Generating…':'Generate code'}</button>
+            {domain && <span className="admin-hint">Registration accepts {domain} addresses only.</span>}
+          </div>
+        </form>
+
+        {issued && <div className="issued-code">
+          <strong>Send this to {issued.entry.assignedEmail || 'the developer'}</strong>
+          <div className="code-value">
+            <code>{issued.code}</code>
+            <CopyButton value={issued.code}/>
+          </div>
+          <p>Shown in full here and nowhere else in the list. You can read it back later with Reveal, but sending it now is simpler.</p>
+          <div className="issued-actions">
+            <button type="button" className="secondary-button" onClick={()=>navigator.clipboard.writeText(inviteMessage(issued.code,issued.entry))}>
+              <Mail size={14}/>Copy the message to send
+            </button>
+            <button type="button" className="text-button" onClick={()=>setIssued(null)}>Done</button>
+          </div>
+        </div>}
+
+        {overview?.sharedCodeEnabled && <div className="admin-note">
+          <Info size={14}/>
+          <p>A single shared code is still configured in <code>REGISTRATION_ACCESS_CODE</code>, so anybody who has it can register without one of these. Clear that variable to make issued codes the only way in.</p>
+        </div>}
+      </section>
+
+      <section className="card span-2">
+        <div className="card-head simple">
+          <div>
+            <div className="card-icon"><ShieldCheck size={17}/></div>
+            <div><h2>Issued codes</h2><p>Withdraw a code to refuse it from now on. A used code stays here as the record of who was let in.</p></div>
+          </div>
+        </div>
+
+        {codes.length === 0
+          ? <div className="admin-empty">No codes yet. Generate one above and send it to the developer it is for.</div>
+          : <div className="code-list">{codes.map(entry=><div key={entry.id} className="code-row">
+              <div className="code-main">
+                <div className="code-id">
+                  <code>{revealed[entry.id] || entry.hint}</code>
+                  <span className={`status-pill ${entry.status}`}>{STATUS_TEXT[entry.status]}</span>
+                  {entry.assignedEmail && <span className="code-for"><Mail size={11}/>{entry.assignedEmail}</span>}
+                </div>
+                <div className="code-meta">
+                  {entry.label && <span>{entry.label}</span>}
+                  <span>Used {entry.uses} of {entry.maxUses}</span>
+                  <span>Issued {shortDate(entry.createdAt)}</span>
+                  {entry.expiresAt && <span>{entry.status==='expired'?'Expired':'Expires'} {shortDate(entry.expiresAt)}</span>}
+                  {entry.lastUsedBy && <span>Claimed by {entry.lastUsedBy}</span>}
+                  {entry.revokedAt && <span>Withdrawn {shortDate(entry.revokedAt)}</span>}
+                </div>
+              </div>
+              <div className="code-actions">
+                {revealed[entry.id]
+                  ? <>
+                      <CopyButton value={revealed[entry.id]} small/>
+                      <button className="icon-button small" title="Hide the code"
+                        onClick={()=>setRevealed(r=>{ const next={...r}; delete next[entry.id]; return next; })}><EyeOff size={14}/></button>
+                    </>
+                  : <button className="icon-button small" title="Reveal the code" onClick={()=>reveal(entry)}><Eye size={14}/></button>}
+                {entry.status!=='revoked' && <button className="icon-button small" title="Withdraw this code" onClick={()=>revoke(entry)}><Ban size={14}/></button>}
+                <button className="icon-button small" title="Delete this code" onClick={()=>remove(entry)}><Trash2 size={14}/></button>
+              </div>
+            </div>)}</div>}
+      </section>
+    </div>}
   </div>;
 }
 

@@ -97,7 +97,56 @@ CREATE TABLE IF NOT EXISTS jsan_login_attempts (
   last_failed_at TEXT NOT NULL
 ) STRICT;
 
+-- Team access codes an admin issues from the portal, one per developer.
+--
+-- REGISTRATION_ACCESS_CODE is a single shared string in the environment: every
+-- developer types the same one, it cannot be withdrawn from one person without
+-- withdrawing it from everybody, and changing it needs a redeploy. This table
+-- is the per-person replacement — an admin generates a code, hands it to one
+-- developer, and it stops working the moment they have used it.
+--
+-- The code is held two ways because two different jobs need it:
+--
+--   code_hash    SHA-256 hex, UNIQUE. What registration looks the code up by,
+--                so a submitted code is matched in one indexed read rather
+--                than by decrypting every row and comparing.
+--   code_cipher* AES-256-GCM under KEY_ENCRYPTION_SECRET, same scheme the
+--                developers' LiteLLM keys use. A hash alone would mean the
+--                plaintext exists only in the response that created it, so an
+--                admin who closed the tab before copying it would have to
+--                issue another one. This lets them read it back.
+--
+-- assigned_email is what makes a code personal: when set, only that address
+-- may spend it, so a code forwarded to somebody else is refused.
+CREATE TABLE IF NOT EXISTS jsan_access_codes (
+  id                TEXT PRIMARY KEY,
+  code_hash         TEXT NOT NULL UNIQUE,
+  code_ciphertext   TEXT NOT NULL,
+  code_iv           TEXT NOT NULL,
+  code_tag          TEXT NOT NULL,
+  -- Enough of the code to recognise it in the list without revealing it.
+  code_hint         TEXT NOT NULL,
+  -- Free text from the admin: who it was cut for, which team, why.
+  label             TEXT NOT NULL DEFAULT '',
+  -- NULL means any address that passes ALLOWED_EMAIL_DOMAIN may use it.
+  assigned_email    TEXT COLLATE NOCASE,
+  max_uses          INTEGER NOT NULL DEFAULT 1 CHECK (max_uses >= 1),
+  uses              INTEGER NOT NULL DEFAULT 0 CHECK (uses >= 0),
+  -- ISO-8601 UTC, or NULL for a code that does not expire on its own.
+  expires_at        TEXT,
+  revoked_at        TEXT,
+  last_used_at      TEXT,
+  last_used_by      TEXT,
+  -- SET NULL rather than CASCADE: an admin account being removed must not
+  -- delete the codes it issued, which are still the record of who was let in.
+  created_by        TEXT REFERENCES jsan_users(id) ON DELETE SET NULL,
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS jsan_access_codes_created_idx
+  ON jsan_access_codes(created_at DESC);
+
 -- Updated rather than left alone, so a database created before the image table
 -- existed reports the version it has actually been migrated to.
-INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '3')
+INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '4')
   ON CONFLICT(key) DO UPDATE SET value = excluded.value;

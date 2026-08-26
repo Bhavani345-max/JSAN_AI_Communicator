@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js"
+    "check": "node --check src/server.js",
+    "test": "node test/access-codes.mjs && node test/shared-code.mjs",
+    "test:shared": "node test/shared-code.mjs"
   },
   "dependencies": {
     "@jsan/database": "file:../database",

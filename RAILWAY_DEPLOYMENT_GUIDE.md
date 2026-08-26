@@ -51,7 +51,15 @@ A fifth route, `see`, is not a mode anyone selects: the portal switches to it by
 Models can be stored in LiteLLM's DB (`STORE_MODEL_IN_DB=True`). If you need the LiteLLM Admin UI during maintenance, expose it only temporarily or put it behind your organization's access control; remove public exposure when finished. Never share the master key with developers.
 
 ## 7. Registration
-Open `https://ai.jsanconsulting.com`, register the owner/test account with the team access code, then verify:
+Sign in as the `ADMIN_EMAILS` account, open **Admin**, and generate a team
+access code for each developer — one per address, so a seat can be withdrawn
+from one person later without reissuing everybody. Send each person the message
+the page writes for them. Where `REGISTRATION_ACCESS_CODE` is still set, that
+shared code keeps working alongside the issued ones; clear it once the team has
+their own.
+
+Open `https://ai.jsanconsulting.com`, register the owner/test account with a
+team access code, then verify:
 - login/logout
 - conversation persistence
 - Auto / Code / Think / Fast

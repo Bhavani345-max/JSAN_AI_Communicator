@@ -12,7 +12,8 @@
 - [ ] LiteLLM has no permanent public domain
 - [ ] Portal has `ai.jsanconsulting.com`
 - [ ] Railway TLS active
-- [ ] Strong registration access code
+- [ ] Strong registration access code, or none at all and codes issued per developer
+- [ ] `ADMIN_EMAILS` set to the accounts that may issue access codes
 - [ ] Strong JWT secret
 - [ ] Strong key-encryption secret
 - [ ] LiteLLM master key generated

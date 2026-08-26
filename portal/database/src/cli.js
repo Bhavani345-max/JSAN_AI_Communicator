@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import { connect, openDatabase, initSchema, databasePath, checkIntegrity } from './sqlite.js';
 
-const TABLES = ['jsan_users', 'jsan_conversations', 'jsan_messages', 'jsan_message_images'];
+const TABLES = ['jsan_users', 'jsan_conversations', 'jsan_messages', 'jsan_message_images', 'jsan_access_codes'];
 
 function sizeOf(file) {
   try { return `${(fs.statSync(file).size / 1024).toFixed(1)} KB`; }
@@ -45,7 +45,13 @@ function status() {
   console.log(`Journal mode  ${journal}`);
   console.log('Rows');
   for (const table of TABLES) {
-    const count = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
+    // A table added by a later schema version is missing rather than empty
+    // until the file has been through `init`. Reported as such: the previous
+    // version raised a raw SQLite error here, which reads like a corrupt
+    // database when the answer is simply that a migration has not been run.
+    let count;
+    try { count = String(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n); }
+    catch { count = 'missing - run: npm run db:init'; }
     console.log(`  ${table.padEnd(20)} ${count}`);
   }
   const indexes = db.prepare(

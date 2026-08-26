@@ -30,7 +30,15 @@ const JWT_SECRET = requireSecret('JWT_SECRET');
 const KEY_ENCRYPTION_SECRET = requireSecret('KEY_ENCRYPTION_SECRET');
 const SESSION_HOURS = Math.max(1, Number(process.env.SESSION_HOURS || 12));
 const MAX_USERS = Math.min(100, Math.max(1, Number(process.env.MAX_USERS || 20)));
-const REGISTRATION_ACCESS_CODE = requireSecret('REGISTRATION_ACCESS_CODE');
+// The one code every developer types, shared by the whole team.
+//
+// No longer required, because it is no longer the only way in: an admin can
+// issue a code per person from the Admin page, and those are checked against
+// jsan_access_codes. Leave this unset and an issued code becomes the only way
+// to claim a seat, which is what makes a code withdrawable from one developer
+// without withdrawing it from everybody. Set, it keeps working exactly as it
+// did, so a deployment that has already handed it out is not broken by this.
+const REGISTRATION_ACCESS_CODE = optionalSecret('REGISTRATION_ACCESS_CODE');
 const ALLOWED_EMAIL_DOMAIN = String(process.env.ALLOWED_EMAIL_DOMAIN || '').trim().toLowerCase();
 const LITELLM_BASE_URL = String(process.env.LITELLM_BASE_URL || 'http://litellm:4000').replace(/\/$/, '');
 const LITELLM_MASTER_KEY = requireSecret('LITELLM_MASTER_KEY');
@@ -91,6 +99,22 @@ const LOGIN_LOCKOUT_MINUTES = Math.max(1, Number(process.env.LOGIN_LOCKOUT_MINUT
 // registration that much earlier, which is the intended reading of the cap.
 const SEED_ACCOUNTS = parseSeedAccounts(process.env.SEED_ACCOUNTS);
 
+// Who may open the Admin page and issue team access codes.
+//
+// A comma-separated list of addresses rather than a column on jsan_users:
+// being an admin is an operator decision, and keeping it in configuration
+// means it is granted or withdrawn by editing one variable, takes effect on
+// the next request, and cannot be escalated by anything the portal itself
+// writes - there is no route that can make an account an admin.
+//
+// Unset, it falls back to the first SEED_ACCOUNTS entry: the account the
+// operator has already declared as their own, so a deployment that set up seed
+// accounts and nothing else still has somebody who can issue codes. With
+// neither configured there are no admins, and REGISTRATION_ACCESS_CODE is the
+// only way anyone registers - which is exactly how the portal behaved before
+// issued codes existed.
+const ADMIN_EMAILS = parseAdminEmails(process.env.ADMIN_EMAILS);
+
 // Chat streaming budgets.
 //
 // A single wall-clock deadline cannot serve both cases here: a real engineering
@@ -133,6 +157,37 @@ function requireSecret(name) {
   const value = String(process.env[name] || '').trim();
   if (!value || value.includes('change-me')) throw new Error(`${name} must be configured`);
   return value;
+}
+
+/**
+ * The same read as requireSecret, for a secret the portal can run without.
+ *
+ * A placeholder is treated as absent rather than accepted: `change-me` left in
+ * an environment file is somebody who has not chosen a value yet, and honouring
+ * it as a real registration code would let anyone who has read the example file
+ * claim a seat.
+ */
+function optionalSecret(name) {
+  const value = String(process.env[name] || '').trim();
+  if (!value) return '';
+  if (value.includes('change-me')) {
+    console.warn(`${name} still holds a placeholder value and is being ignored`);
+    return '';
+  }
+  return value;
+}
+
+/** The admin address list, lowercased, with the documented fallback applied. */
+function parseAdminEmails(raw) {
+  const listed = String(raw || '')
+    .split(/[,;\s]+/)
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+  if (listed.length) return new Set(listed);
+  const fallback = SEED_ACCOUNTS[0]?.email;
+  if (fallback) console.log(`ADMIN_EMAILS is not set - the first seed account (${fallback}) is the admin`);
+  else console.log('ADMIN_EMAILS is not set and there are no seed accounts - no account can issue access codes');
+  return new Set(fallback ? [fallback] : []);
 }
 
 /**
@@ -321,10 +376,13 @@ function encryptText(value) {
   const ciphertext = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
   return { ciphertext: ciphertext.toString('base64'), iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64') };
 }
+function decryptText({ ciphertext, iv, tag }) {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), Buffer.from(iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(tag, 'base64'));
+  return Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]).toString('utf8');
+}
 function decryptKey(row) {
-  const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), Buffer.from(row.litellm_key_iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(row.litellm_key_tag, 'base64'));
-  return Buffer.concat([decipher.update(Buffer.from(row.litellm_key_ciphertext, 'base64')), decipher.final()]).toString('utf8');
+  return decryptText({ ciphertext: row.litellm_key_ciphertext, iv: row.litellm_key_iv, tag: row.litellm_key_tag });
 }
 
 function createSession(user) {
@@ -343,6 +401,134 @@ function safeEqual(a, b) {
   const aa = Buffer.from(String(a));
   const bb = Buffer.from(String(b));
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+// ---------------------------------------------------------------------------
+// Team access codes
+//
+// One code, one developer. An admin generates a code in the portal, hands it to
+// the person it was cut for, and it stops working once they have used it - so a
+// seat can be withdrawn from one developer without changing anything for the
+// rest, which the single shared REGISTRATION_ACCESS_CODE could never do.
+// ---------------------------------------------------------------------------
+
+// Codes get read out over a call, typed by hand and pasted into chat, so the
+// alphabet leaves out every pair that gets mistaken for the other: no O or 0,
+// no I, L or 1. 31 symbols over 15 positions is about 74 bits, which is far
+// past anything the registration rate limit would let through.
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const CODE_GROUPS = 3;
+const CODE_GROUP_SIZE = 5;
+// Bounds on what an admin may ask for. A code for one person is the default;
+// the upper bound exists so a slip in the form cannot mint an open invitation.
+const CODE_MAX_USES_LIMIT = 20;
+const CODE_MAX_EXPIRY_DAYS = 365;
+const CODE_DEFAULT_EXPIRY_DAYS = 14;
+
+const CODE_INVALID = 'The team access code is not valid';
+const CODE_REFUSALS = {
+  revoked: 'That access code has been withdrawn. Ask your JSAN admin for a new one.',
+  expired: 'That access code has expired. Ask your JSAN admin for a new one.',
+  used: 'That access code has already been used. Ask your JSAN admin for a new one.',
+  wrongEmail: 'That access code was issued for a different email address.'
+};
+
+/** A fresh code, in the JSAN-XXXXX-XXXXX-XXXXX shape the admin page shows. */
+function newAccessCode() {
+  const groups = [];
+  for (let group = 0; group < CODE_GROUPS; group++) {
+    let text = '';
+    // randomInt is rejection-sampled, so no symbol in the alphabet is likelier
+    // than another - which `randomBytes(1) % 31` would not give.
+    for (let i = 0; i < CODE_GROUP_SIZE; i++) text += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
+    groups.push(text);
+  }
+  return `JSAN-${groups.join('-')}`;
+}
+
+/**
+ * The form a code is matched in.
+ *
+ * Somebody typing a code out of an email will lowercase it, drop the dashes or
+ * paste it with a trailing space, and none of those are a different code. The
+ * separators carry no information - they are there to make 15 characters
+ * readable - so they are removed before hashing rather than demanded back.
+ */
+function normalizeAccessCode(value) {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/** Lookup key for a code, or null when nothing usable was submitted. */
+function accessCodeDigest(value) {
+  const normalized = normalizeAccessCode(value);
+  if (!normalized) return null;
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+/** Enough of a code to recognise it in a list, without handing it back. */
+function accessCodeHint(code) {
+  return `${code.slice(0, 4)}…${code.slice(-4)}`;
+}
+
+/** active | used | expired | revoked. The order matters: revoked wins. */
+function accessCodeStatus(row, now = Date.now()) {
+  if (row.revoked_at) return 'revoked';
+  if (row.expires_at && Date.parse(row.expires_at) <= now) return 'expired';
+  if (row.uses >= row.max_uses) return 'used';
+  return 'active';
+}
+
+/** The admin page's view of a code. Never carries the code itself. */
+function serializeAccessCode(row) {
+  const status = accessCodeStatus(row);
+  return {
+    id: row.id,
+    hint: row.code_hint,
+    label: row.label || '',
+    assignedEmail: row.assigned_email || null,
+    maxUses: row.max_uses,
+    uses: row.uses,
+    remaining: Math.max(0, row.max_uses - row.uses),
+    status,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at || null,
+    revokedAt: row.revoked_at || null,
+    lastUsedAt: row.last_used_at || null,
+    lastUsedBy: row.last_used_by || null,
+    createdByEmail: row.created_by_email || null
+  };
+}
+
+/**
+ * Decide whether a submitted code admits this address.
+ *
+ * Returns `{ ok: true, code }` where `code` is the row to spend, or null when
+ * the shared environment code was used and there is no row to spend. A refusal
+ * carries the sentence the person will read.
+ *
+ * Read-only on purpose: nothing is consumed here. The code is spent inside the
+ * registration transaction, so a signup that fails afterwards - a full portal,
+ * a duplicate address - leaves the code still usable.
+ */
+function checkAccessCode(submitted, email) {
+  // The shared code is an arbitrary secret rather than one of the issued ones,
+  // so it is compared verbatim and in constant time, not normalized.
+  if (REGISTRATION_ACCESS_CODE && safeEqual(submitted, REGISTRATION_ACCESS_CODE)) return { ok: true, code: null };
+  const digest = accessCodeDigest(submitted);
+  if (!digest) return { ok: false, error: CODE_INVALID };
+  const row = db.prepare('SELECT * FROM jsan_access_codes WHERE code_hash=?').get(digest);
+  if (!row) return { ok: false, error: CODE_INVALID };
+  const status = accessCodeStatus(row);
+  if (status !== 'active') return { ok: false, error: CODE_REFUSALS[status] };
+  if (row.assigned_email && row.assigned_email.toLowerCase() !== email) {
+    return { ok: false, error: CODE_REFUSALS.wrongEmail };
+  }
+  return { ok: true, code: row };
+}
+
+/** Is this signed-in account allowed to issue codes? */
+function isAdmin(user) {
+  return !!user && ADMIN_EMAILS.has(String(user.email || '').toLowerCase());
 }
 // A shared daily allowance that is spent behaves nothing like a momentary burst
 // limit: no amount of retrying clears it. Telling someone to "try again in a
@@ -581,6 +767,27 @@ async function auth(req, res, next) {
   next();
 }
 
+// Admin gate. Always mounted after `auth`, so req.user is the row this process
+// just read - admin is decided from the account's current address against the
+// current ADMIN_EMAILS, never from a claim inside the session cookie. An
+// address removed from the list therefore loses the Admin page immediately,
+// rather than at the end of a twelve-hour session.
+function adminOnly(req, res, next) {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: 'Admin access is required' });
+  next();
+}
+
+// Admin actions: authenticated and few, so this only bounds a stuck client or
+// a script looping on code generation. Keyed on the account, like chat.
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id ?? byIp(req),
+  message: { error: 'Too many admin requests in a row. Wait a moment and try again.' }
+});
+
 app.get('/api/health', async (_req, res) => {
   // Named dbOk because `db` at module scope is the connection itself.
   let dbOk = false, gateway = false, registeredUsers = 0;
@@ -617,10 +824,15 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
   const confirmPassword = String(req.body?.confirmPassword || '');
   const accessCode = String(req.body?.accessCode || '');
 
-  if (!safeEqual(accessCode, REGISTRATION_ACCESS_CODE)) return res.status(403).json({ error: 'The team access code is not valid' });
   if (name.length < 2 || name.length > 80) return res.status(400).json({ error: 'Enter your name' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid work email' });
   if (ALLOWED_EMAIL_DOMAIN && !email.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) return res.status(400).json({ error: `Use your ${ALLOWED_EMAIL_DOMAIN} email` });
+  // The address is checked before the code, which is a change from when the
+  // code was a single shared string: an issued code can be bound to one
+  // address, so it cannot be judged until there is a valid address to judge it
+  // against. A typo'd email would otherwise be reported as somebody else's code.
+  const admitted = checkAccessCode(accessCode, email);
+  if (!admitted.ok) return res.status(403).json({ error: admitted.error });
   if (password.length < 10) return res.status(400).json({ error: 'Use at least 10 characters for your password' });
   // Checked here as well as in the form: /api/auth/register is reachable
   // without it, and a typo confirmed only by the browser is still a typo that
@@ -664,6 +876,23 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
       if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email)) {
         throw new RegistrationConflict('An account already exists for this email');
       }
+      // Spend the issued code in the same transaction as the row it admits.
+      // Checked again rather than trusted from above: the earlier read was not
+      // under the write lock, so two people holding the same single-use code
+      // could both have passed it. Here the second one finds uses already at
+      // max_uses and is refused, and a rollback for any other reason - a full
+      // portal, a duplicate address - leaves the code unspent and still usable.
+      if (admitted.code) {
+        const current = db.prepare('SELECT * FROM jsan_access_codes WHERE id=?').get(admitted.code.id);
+        if (!current) throw new RegistrationConflict(CODE_INVALID);
+        const status = accessCodeStatus(current);
+        if (status !== 'active') throw new RegistrationConflict(CODE_REFUSALS[status]);
+        if (current.assigned_email && current.assigned_email.toLowerCase() !== email) {
+          throw new RegistrationConflict(CODE_REFUSALS.wrongEmail);
+        }
+        db.prepare('UPDATE jsan_access_codes SET uses=uses+1,last_used_at=?,last_used_by=? WHERE id=?')
+          .run(nowIso(), email, current.id);
+      }
       db.prepare(`INSERT INTO jsan_users(id,name,email,password_hash,litellm_user_id,litellm_key_ciphertext,litellm_key_iv,litellm_key_tag,last_login_at)
         VALUES(?,?,?,?,?,?,?,?,?)`)
         .run(id, name, email, passwordHash, provision.litellmUserId, encrypted.ciphertext, encrypted.iv, encrypted.tag, nowIso());
@@ -677,7 +906,7 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
 
   const user = { id, name, email };
   setSessionCookie(res, createSession(user));
-  return res.status(201).json({ user });
+  return res.status(201).json({ user: { ...user, isAdmin: isAdmin(user) } });
 });
 
 // Failed sign-ins.
@@ -778,7 +1007,7 @@ app.post('/api/auth/login', loginIpLimiter, async (req, res) => {
   clearLoginFailures(email);
   db.prepare('UPDATE jsan_users SET last_login_at=? WHERE id=?').run(nowIso(), user.id);
   setSessionCookie(res, createSession(user));
-  res.json({ user: { id: user.id, name: user.name, email: user.email } });
+  res.json({ user: { id: user.id, name: user.name, email: user.email, isAdmin: isAdmin(user) } });
 });
 
 app.post('/api/auth/logout', (_req, res) => {
@@ -786,7 +1015,7 @@ app.post('/api/auth/logout', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', auth, (req, res) => res.json({ id: req.user.id, name: req.user.name, email: req.user.email }));
+app.get('/api/me', auth, (req, res) => res.json({ id: req.user.id, name: req.user.name, email: req.user.email, isAdmin: isAdmin(req.user) }));
 
 app.get('/api/me/api-key', auth, (req, res) => {
   try { res.json({ apiKey: decryptKey(req.user) }); }
@@ -807,6 +1036,140 @@ app.post('/api/me/api-key/rotate', auth, async (req, res) => {
     console.error('Key rotation failed:', e.message);
     res.status(502).json({ error: cleanError(e, 'Could not rotate your key') });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Admin: issuing team access codes
+//
+// Every route here is `auth, adminOnly, adminLimiter`. adminOnly reads the
+// account this process just loaded rather than a claim in the cookie, so an
+// address dropped from ADMIN_EMAILS loses these routes on its next request.
+//
+// Nothing in this section returns a code except /reveal and the response that
+// creates one: the list is deliberately hint-only, so a screen share of the
+// Admin page does not hand out anybody's seat.
+// ---------------------------------------------------------------------------
+
+const LIST_CODES = `SELECT c.*, u.email AS created_by_email
+  FROM jsan_access_codes c LEFT JOIN jsan_users u ON u.id = c.created_by
+  ORDER BY c.created_at DESC LIMIT 200`;
+
+/** One code with the issuing admin's address attached, as the list returns it. */
+function accessCodeById(id) {
+  return db.prepare(`SELECT c.*, u.email AS created_by_email
+    FROM jsan_access_codes c LEFT JOIN jsan_users u ON u.id = c.created_by WHERE c.id=?`).get(id);
+}
+
+app.get('/api/admin/overview', auth, adminOnly, adminLimiter, (_req, res) => {
+  const { count } = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get();
+  const codes = db.prepare('SELECT revoked_at, expires_at, uses, max_uses FROM jsan_access_codes').all();
+  const now = Date.now();
+  const active = codes.filter(row => accessCodeStatus(row, now) === 'active').length;
+  res.json({
+    registeredUsers: count,
+    maxUsers: MAX_USERS,
+    seatsRemaining: Math.max(0, MAX_USERS - count),
+    registrationOpen: count < MAX_USERS,
+    activeCodes: active,
+    totalCodes: codes.length,
+    emailDomain: ALLOWED_EMAIL_DOMAIN || null,
+    // Whether the old team-wide code is still accepted beside issued ones. The
+    // code itself is never sent - only whether one is configured, so an admin
+    // can see that a second way in exists and turn it off if they meant to.
+    sharedCodeEnabled: Boolean(REGISTRATION_ACCESS_CODE),
+    admins: [...ADMIN_EMAILS],
+    limits: { defaultExpiryDays: CODE_DEFAULT_EXPIRY_DAYS, maxUses: CODE_MAX_USES_LIMIT, maxExpiryDays: CODE_MAX_EXPIRY_DAYS }
+  });
+});
+
+app.get('/api/admin/access-codes', auth, adminOnly, adminLimiter, (_req, res) => {
+  res.json({ codes: db.prepare(LIST_CODES).all().map(serializeAccessCode) });
+});
+
+app.post('/api/admin/access-codes', auth, adminOnly, adminLimiter, (req, res) => {
+  const label = String(req.body?.label || '').trim().slice(0, 80);
+  const assignedEmail = String(req.body?.assignedEmail || '').trim().toLowerCase();
+
+  if (assignedEmail) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(assignedEmail)) {
+      return res.status(400).json({ error: 'Enter a valid email for the developer, or leave it blank' });
+    }
+    // Refused here rather than at registration: a code bound to an address the
+    // domain rule will reject is a code that can never be spent, and the person
+    // it was handed to would be the one to find that out.
+    if (ALLOWED_EMAIL_DOMAIN && !assignedEmail.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) {
+      return res.status(400).json({ error: `Registration only accepts ${ALLOWED_EMAIL_DOMAIN} addresses, so this code could never be used` });
+    }
+    if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(assignedEmail)) {
+      return res.status(409).json({ error: 'That developer already has an account' });
+    }
+  }
+
+  // Both bounds reject rather than clamp. A form that silently turned "3o" into
+  // a code that never expires would be worse than one that says no.
+  const rawUses = req.body?.maxUses;
+  const maxUses = rawUses === undefined || rawUses === null || rawUses === '' ? 1 : Number(rawUses);
+  if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > CODE_MAX_USES_LIMIT) {
+    return res.status(400).json({ error: `A code may be used between 1 and ${CODE_MAX_USES_LIMIT} times` });
+  }
+  const rawDays = req.body?.expiresInDays;
+  const days = rawDays === undefined || rawDays === null || rawDays === '' ? CODE_DEFAULT_EXPIRY_DAYS : Number(rawDays);
+  if (!Number.isInteger(days) || days < 0 || days > CODE_MAX_EXPIRY_DAYS) {
+    return res.status(400).json({ error: `Expiry must be between 0 and ${CODE_MAX_EXPIRY_DAYS} days, where 0 never expires` });
+  }
+  const expiresAt = days > 0 ? new Date(Date.now() + days * 86_400_000).toISOString() : null;
+
+  // The plaintext is returned once here and kept encrypted in the row, so the
+  // admin can read it back later from /reveal rather than having to issue a
+  // second code because they closed the tab before copying the first.
+  const id = crypto.randomUUID();
+  const code = newAccessCode();
+  const encrypted = encryptText(code);
+  try {
+    db.prepare(`INSERT INTO jsan_access_codes(id,code_hash,code_ciphertext,code_iv,code_tag,code_hint,label,assigned_email,max_uses,expires_at,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, accessCodeDigest(code), encrypted.ciphertext, encrypted.iv, encrypted.tag,
+           accessCodeHint(code), label, assignedEmail || null, maxUses, expiresAt, req.user.id);
+  } catch (e) {
+    console.error('Could not issue an access code:', e.message);
+    return res.status(500).json({ error: 'Could not issue the access code. Try again.' });
+  }
+
+  console.log(`Access code ${accessCodeHint(code)} issued by ${req.user.email}${assignedEmail ? ` for ${assignedEmail}` : ''}`);
+  res.status(201).json({ code, entry: serializeAccessCode(accessCodeById(id)) });
+});
+
+app.get('/api/admin/access-codes/:id/reveal', auth, adminOnly, adminLimiter, (req, res) => {
+  const row = db.prepare('SELECT * FROM jsan_access_codes WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'That access code no longer exists' });
+  try {
+    res.json({ code: decryptText({ ciphertext: row.code_ciphertext, iv: row.code_iv, tag: row.code_tag }) });
+  } catch {
+    // The only realistic cause is KEY_ENCRYPTION_SECRET having been rotated
+    // since the code was issued, which is the same thing that makes a stored
+    // LiteLLM key unreadable. The code itself still works for whoever holds it,
+    // since the hash is untouched - it just cannot be read back here.
+    res.status(500).json({ error: 'This code cannot be read back, because the encryption secret changed after it was issued. Revoke it and issue a new one.' });
+  }
+});
+
+app.post('/api/admin/access-codes/:id/revoke', auth, adminOnly, adminLimiter, (req, res) => {
+  const row = db.prepare('SELECT * FROM jsan_access_codes WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'That access code no longer exists' });
+  if (!row.revoked_at) db.prepare('UPDATE jsan_access_codes SET revoked_at=? WHERE id=?').run(nowIso(), row.id);
+  console.log(`Access code ${row.code_hint} revoked by ${req.user.email}`);
+  res.json({ entry: serializeAccessCode(accessCodeById(row.id)) });
+});
+
+// Removes the record entirely. Revoking is the safer action and the one the
+// page leads with - a revoked code stays in the list as the account of who was
+// let in and when - so this is for tidying up codes that were never used.
+app.delete('/api/admin/access-codes/:id', auth, adminOnly, adminLimiter, (req, res) => {
+  const row = db.prepare('SELECT code_hint FROM jsan_access_codes WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'That access code no longer exists' });
+  db.prepare('DELETE FROM jsan_access_codes WHERE id=?').run(req.params.id);
+  console.log(`Access code ${row.code_hint} deleted by ${req.user.email}`);
+  res.json({ ok: true });
 });
 
 // The composer sends an attached file as its full text, because that is what the
