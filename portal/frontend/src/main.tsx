@@ -1351,15 +1351,31 @@ function AdminPage() {
     : requested.length > 1 ? `Generate ${requested.length} codes`
     : 'Generate code';
 
-  /** A code cell, blanked to its hint while codes are hidden. */
+  /**
+   * A code, shown in full.
+   *
+   * Hiding replaces it with dots of the same shape rather than the first and
+   * last few characters. An abbreviation is indistinguishable from a code the
+   * layout has cut off — somebody reading `JSAN…PAYJA` cannot tell whether the
+   * page is hiding it or losing it — and a row of dots can only be read one
+   * way. Copy keeps working while hidden, since the value is there either way.
+   */
   const codeCell = (entry:AccessCode, size:'row'|'large'='row') => {
     if(!entry.readable) return <span className="code-unreadable" title="Issued before the encryption secret was rotated, so it cannot be read back. It still works for whoever holds it.">Cannot be read back</span>;
     const value = entry.code as string;
     return <>
-      <code className={size==='large'?'code-large':''}>{showCodes ? value : entry.hint}</code>
+      <code className={`code-value ${size==='large'?'code-large':''} ${showCodes?'':'code-hidden'}`}
+        title={showCodes ? 'Click to select the whole code' : 'Hidden — use Show codes'}>
+        {showCodes ? value : value.replace(/[^-]/g,'•')}
+      </code>
       <CopyButton value={value} small={size==='row'}/>
     </>;
   };
+
+  /** Everyone's code as `name<TAB>email<TAB>code` lines, for a spreadsheet. */
+  const everyonesCodes = () => users
+    .map(user=>`${user.name}\t${user.email}\t${user.accessCode?.code || `(${ADMITTED_TEXT[user.admittedBy].toLowerCase()})`}`)
+    .join('\n');
 
   return <div className="page">
     <header className="page-header">
@@ -1459,9 +1475,14 @@ function AdminPage() {
             <div className="card-icon"><Users size={17}/></div>
             <div><h2>Developers</h2><p>Everyone with a seat, and the access code that let them in.</p></div>
           </div>
-          <button className="secondary-button" onClick={()=>setShowCodes(v=>!v)}>
-            {showCodes ? <><EyeOff size={14}/>Hide codes</> : <><Eye size={14}/>Show codes</>}
-          </button>
+          <div className="head-actions">
+            {users.length>0 && <button className="secondary-button" onClick={()=>navigator.clipboard.writeText(everyonesCodes())}>
+              <Copy size={14}/>Copy every code
+            </button>}
+            <button className="secondary-button" onClick={()=>setShowCodes(v=>!v)}>
+              {showCodes ? <><EyeOff size={14}/>Hide codes</> : <><Eye size={14}/>Show codes</>}
+            </button>
+          </div>
         </div>
 
         {users.length === 0

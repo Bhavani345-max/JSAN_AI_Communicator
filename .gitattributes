@@ -1,0 +1,23 @@
+# This repository is edited on Windows and built inside a Linux container, so
+# what Git does to line endings on the way through is not cosmetic here.
+#
+# core.autocrlf is on for the working copy, which means Git decides per file
+# whether it is text. It guesses well, but a wrong guess on a binary is silent
+# and total: converting the byte 0x0A to 0x0D 0x0A inside a PNG or an ICO
+# corrupts every file that happens to contain it, and the damage only appears
+# after a deploy, as an icon or an image that will not render. These say
+# outright which files must never be touched.
+*.png binary
+*.ico binary
+*.svg text eol=lf
+*.pdf binary
+*.pptx binary
+*.db  binary
+
+# Shell scripts run inside the image. A CRLF line ending after the shebang is
+# read by Linux as part of the interpreter's name, so the container dies with
+# "no such file or directory" naming a binary that plainly exists. The portal
+# entrypoint has already been the subject of one fix in this repository's
+# history; this stops the line-ending half of that class of failure.
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf

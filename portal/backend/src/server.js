@@ -1799,9 +1799,23 @@ app.use('/v1', byApiKey, async (req, res) => {
 });
 
 app.use(express.static(staticDir, { maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0 }));
+
+// Single-page fallback: an address a developer can navigate to is answered with
+// index.html, because the portal's pages are state inside one document rather
+// than routes this server knows about.
+//
+// A path that names a file is exempt, and that exemption is the point.
+// express.static has already looked for it and not found it, so answering with
+// index.html would return HTML under a .js, .png or .ico name - a 200 hiding a
+// 404. That is how a missing favicon becomes a blank tab instead of an error
+// somebody can see: every browser asks for /favicon.ico whether or not the page
+// links to one, and a 200 carrying HTML is read as a broken icon and cached as
+// one. The same fallback turns a mis-hashed bundle into "Unexpected token '<'"
+// rather than "not found". Missing files now 404, which is what they are.
+const PATH_NAMES_A_FILE = /\.[a-z0-9]+$/i;
 app.use((req, res, next) => {
-  if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.sendFile(path.join(staticDir, 'index.html'));
-  next();
+  if (req.method !== 'GET' || req.path.startsWith('/api/') || PATH_NAMES_A_FILE.test(req.path)) return next();
+  res.sendFile(path.join(staticDir, 'index.html'));
 });
 
 // A virtual key is scoped to a fixed list of model names when it is issued, so

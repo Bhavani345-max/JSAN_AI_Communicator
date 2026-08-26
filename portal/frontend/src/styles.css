@@ -453,9 +453,19 @@
 
 .code-list{margin-top:16px;display:grid;gap:8px}
 .code-row{border:1px solid var(--line);border-radius:11px;background:var(--panel2);padding:12px 12px 12px 14px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center}
+/* auto, not max-content: the code column takes exactly the width the code
+   needs, and the details beside it give up space rather than the code doing so. */
+.code-row>.code-actions{min-width:max-content}
 .code-main{min-width:0}
 .code-id{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .code-id code{font-size:11px;font-weight:750;letter-spacing:.03em}
+/* A code must never be shrunk, wrapped mid-way or clipped by a neighbour: half
+   a code is worse than none, because it looks like a whole one. flex:none and
+   nowrap keep it at its natural width whatever else is in the row, and
+   user-select:all makes one click take the whole thing rather than a word. */
+.code-value{flex:none;white-space:nowrap;user-select:all;font-size:12px;font-weight:750;letter-spacing:.04em}
+.code-hidden{user-select:none;letter-spacing:.12em;color:var(--muted)}
+.head-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .code-for{display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--muted)}
 .code-meta{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px 14px;font-size:9px;color:var(--muted)}
 .code-actions{display:flex;align-items:center;gap:3px}
@@ -490,7 +500,7 @@
 .issued-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:9px 9px 9px 13px}
 .issued-who{font-size:10px;color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .issued-code-value{display:flex;align-items:center;gap:7px;min-width:0}
-.code-large{font-size:14px;font-weight:750;letter-spacing:.05em;white-space:nowrap}
+.code-large{font-size:15px;letter-spacing:.05em}
 .issue-skipped{margin-top:14px;border-top:1px solid var(--line);padding-top:13px}
 .issue-skipped strong{font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:800}
 .issue-skipped p{margin:7px 0 0;font-size:9px;color:var(--muted);display:flex;gap:9px}

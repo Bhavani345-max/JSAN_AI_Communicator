@@ -3,18 +3,18 @@
 //
 //   npm run icons        (from portal/frontend)
 //
-// Writes public/favicon.svg, public/favicon-32.png and
-// public/apple-touch-icon.png from one description of the JSAN mark, so the
-// vector and the raster versions cannot drift apart.
+// Writes public/favicon.ico, public/favicon.svg and public/apple-touch-icon.png
+// from one description of the JSAN mark, so the vector and the raster versions
+// cannot drift apart.
 //
 // The mark is the bracket on the left of public/jsan-logo.png, measured off
 // that file: the wordmark beside it is 172x56 and unreadable below about 64
 // pixels, so a favicon built from the whole logo would be a grey smudge in the
 // tab. The bracket alone stays legible at 16.
 //
-// PNGs are written by hand rather than with a rendering library, because the
-// portal has no image dependency and this is four rectangles and a rounded
-// corner - not enough to justify one. Coverage is sampled 4x4 per pixel and
+// The PNG and ICO files are written by hand rather than with a rendering
+// library, because the portal has no image dependency and this is four
+// rectangles and a rounded corner - not enough to justify one. Coverage is sampled 4x4 per pixel and
 // averaged, which is what keeps the corners and edges from being jagged.
 
 import fs from 'node:fs';
@@ -108,7 +108,7 @@ function chunk(type, body) {
 }
 
 /**
- * Render the icon at `size` and encode it as an RGBA PNG.
+ * The icon at `size`, as top-down RGBA pixels.
  *
  * SAMPLES x SAMPLES points per pixel, averaged. Straight averaging of coverage
  * is only correct because the two colours are composited in the right order:
@@ -116,13 +116,11 @@ function chunk(type, body) {
  * faded out by how much of the pixel the tile covers. Averaging the final
  * colour and the alpha separately would fringe the outer corners with white.
  */
-function renderPng(size) {
+function renderRgba(size) {
   const SAMPLES = 4;
   const scale = SIZE / size;
-  const stride = size * 4 + 1;
-  const raw = Buffer.alloc(size * stride);
+  const pixels = Buffer.alloc(size * size * 4);
   for (let py = 0; py < size; py++) {
-    raw[py * stride] = 0; // filter type: none
     for (let px = 0; px < size; px++) {
       let tile = 0, mark = 0;
       for (let sy = 0; sy < SAMPLES; sy++) {
@@ -134,16 +132,26 @@ function renderPng(size) {
           if (inMark(x, y)) mark++;
         }
       }
-      const total = SAMPLES * SAMPLES;
-      const at = py * stride + 1 + px * 4;
-      if (tile === 0) { raw.writeUInt32BE(0, at); continue; }
+      const at = (py * size + px) * 4;
+      if (tile === 0) continue; // already transparent black
       const white = mark / tile;
       const mix = (channel) => Math.round(BLUE[channel] + (WHITE[channel] - BLUE[channel]) * white);
-      raw[at] = mix('r');
-      raw[at + 1] = mix('g');
-      raw[at + 2] = mix('b');
-      raw[at + 3] = Math.round((tile / total) * 255);
+      pixels[at] = mix('r');
+      pixels[at + 1] = mix('g');
+      pixels[at + 2] = mix('b');
+      pixels[at + 3] = Math.round((tile / (SAMPLES * SAMPLES)) * 255);
     }
+  }
+  return pixels;
+}
+
+/** Wrap rendered pixels as a PNG. */
+function encodePng(size, pixels) {
+  const stride = size * 4 + 1;
+  const raw = Buffer.alloc(size * stride);
+  for (let py = 0; py < size; py++) {
+    raw[py * stride] = 0; // filter type: none
+    pixels.copy(raw, py * stride + 1, py * size * 4, (py + 1) * size * 4);
   }
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
@@ -158,13 +166,84 @@ function renderPng(size) {
   ]);
 }
 
+const renderPng = (size) => encodePng(size, renderRgba(size));
+
+/**
+ * Pack several sizes into one .ico.
+ *
+ * Written as classic 32-bit BMP images rather than the PNG-in-ICO that modern
+ * encoders emit. Both are legal and every current browser reads either, but a
+ * favicon is exactly the file that gets fetched by the oldest thing on the
+ * network - a crawler, a link unfurler, a chat client's preview fetcher - and
+ * BMP is the one all of them have always understood.
+ *
+ * Two quirks of the format worth knowing before editing this: the height in
+ * the header is doubled because the image is stored as colour data followed by
+ * a 1-bit transparency mask, and rows run bottom-up. The mask is redundant
+ * beside a real alpha channel, but it has to be there and has to be the right
+ * size, so it is written from the alpha rather than left as zeroes.
+ */
+function encodeIco(sizes) {
+  const images = sizes.map(size => {
+    const pixels = renderRgba(size);
+    const xorStride = size * 4;
+    const andStride = Math.ceil(size / 8 / 4) * 4;
+    const xor = Buffer.alloc(size * xorStride);
+    const and = Buffer.alloc(size * andStride);
+    for (let py = 0; py < size; py++) {
+      const row = size - 1 - py; // bottom-up
+      for (let px = 0; px < size; px++) {
+        const from = (py * size + px) * 4;
+        const to = row * xorStride + px * 4;
+        xor[to] = pixels[from + 2];      // B
+        xor[to + 1] = pixels[from + 1];  // G
+        xor[to + 2] = pixels[from];      // R
+        xor[to + 3] = pixels[from + 3];  // A
+        // A set bit means "leave what is behind this pixel alone".
+        if (pixels[from + 3] === 0) and[row * andStride + (px >> 3)] |= 0x80 >> (px & 7);
+      }
+    }
+    const header = Buffer.alloc(40);
+    header.writeUInt32LE(40, 0);            // biSize
+    header.writeInt32LE(size, 4);           // biWidth
+    header.writeInt32LE(size * 2, 8);       // biHeight: colour data plus mask
+    header.writeUInt16LE(1, 12);            // biPlanes
+    header.writeUInt16LE(32, 14);           // biBitCount
+    header.writeUInt32LE(0, 16);            // biCompression: none
+    header.writeUInt32LE(xor.length + and.length, 20); // biSizeImage
+    return { size, body: Buffer.concat([header, xor, and]) };
+  });
+
+  const dir = Buffer.alloc(6 + images.length * 16);
+  dir.writeUInt16LE(0, 0);                  // reserved
+  dir.writeUInt16LE(1, 2);                  // type: icon
+  dir.writeUInt16LE(images.length, 4);
+  let offset = dir.length;
+  images.forEach((image, index) => {
+    const at = 6 + index * 16;
+    dir[at] = image.size === 256 ? 0 : image.size;     // 0 means 256
+    dir[at + 1] = image.size === 256 ? 0 : image.size;
+    dir[at + 2] = 0;                        // palette size: not paletted
+    dir[at + 3] = 0;                        // reserved
+    dir.writeUInt16LE(1, at + 4);           // planes
+    dir.writeUInt16LE(32, at + 6);          // bits per pixel
+    dir.writeUInt32LE(image.body.length, at + 8);
+    dir.writeUInt32LE(offset, at + 12);
+    offset += image.body.length;
+  });
+  return Buffer.concat([dir, ...images.map(image => image.body)]);
+}
+
 // --- Write -----------------------------------------------------------------
 
 const written = [
+  // Every browser asks for /favicon.ico whether or not the page links to one,
+  // and so does anything that unfurls a link. Without this file that request
+  // reaches the single-page fallback and is answered with index.html - a 200
+  // carrying HTML under an .ico name, which is read as a broken icon and then
+  // cached as one. It is first in the list for the same reason.
+  ['favicon.ico', encodeIco([16, 32, 48])],
   ['favicon.svg', Buffer.from(buildSvg(), 'utf8')],
-  // For Safari, which does not take an SVG favicon, and for anything else
-  // falling back to a raster one.
-  ['favicon-32.png', renderPng(32)],
   // Home-screen icon on iOS, which crops to its own rounded shape - so the
   // mark's padding inside the tile is what keeps it from being clipped.
   ['apple-touch-icon.png', renderPng(180)]
