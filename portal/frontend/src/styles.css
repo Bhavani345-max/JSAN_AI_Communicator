@@ -522,3 +522,9 @@
   .issued-row{grid-template-columns:minmax(0,1fr);gap:8px}
   .admin-form .full-row.narrow input{max-width:none}
 }
+
+/* Shown on the sign-in card when a session ended under an open tab. Not an
+   error - nothing went wrong and nothing was lost - so it reads as a notice. */
+.auth-notice{display:flex;gap:9px;align-items:flex-start;border:1px solid var(--line2);background:var(--panel2);border-radius:10px;padding:11px 12px;margin-bottom:18px}
+.auth-notice svg{flex:none;margin-top:1px;color:var(--accent)}
+.auth-notice p{margin:0;font-size:10px;line-height:1.6;color:var(--muted)}

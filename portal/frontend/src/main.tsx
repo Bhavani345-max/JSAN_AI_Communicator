@@ -86,6 +86,17 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Called when the server says the session is gone.
+ *
+ * Registered by App. Before this existed, `user` was read once at mount and
+ * never checked again, so a session that lapsed while the tab stayed open left
+ * the app showing a signed-in workspace whose every request was refused - and
+ * the refusal surfaced as "Sign in required" in the corner of a page that
+ * plainly said you were signed in. The app now stops claiming it.
+ */
+let onSessionLost:(()=>void)|null = null;
+
 async function api(path:string, options:RequestInit = {}) {
   const res = await fetch(path, {
     credentials:'include',
@@ -93,7 +104,12 @@ async function api(path:string, options:RequestInit = {}) {
     headers:{ ...(options.body ? {'Content-Type':'application/json'} : {}), ...(options.headers || {}) }
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(res.status, data);
+  if (!res.ok) {
+    // Only a session that has ended, which the server marks. A 401 from
+    // /api/auth/login is a wrong password and must leave the form where it is.
+    if (res.status === 401 && data?.code === 'session_expired') onSessionLost?.();
+    throw new ApiError(res.status, data);
+  }
   return data;
 }
 
@@ -462,7 +478,7 @@ function AuthAlert({state,secondsLeft,onClose}:{state:AuthAlertState;secondsLeft
   </div>;
 }
 
-function Auth({onReady}:{onReady:(u:User)=>void}) {
+function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnded?:boolean}) {
   const [tab,setTab] = useState<'login'|'register'>('login');
   const [form,setForm] = useState({name:'',email:'',password:'',confirmPassword:'',accessCode:''});
   const [status,setStatus] = useState<any>(null);
@@ -560,6 +576,10 @@ function Auth({onReady}:{onReady:(u:User)=>void}) {
           <button type="button" className={tab==='login'?'active':''} onClick={()=>{setTab('login');setError('')}}>Sign in</button>
           <button type="button" disabled={!canRegister} className={tab==='register'?'active':''} onClick={()=>{setTab('register');setError('')}}>Register</button>
         </div>
+        {sessionEnded && tab==='login' && <div className="auth-notice">
+          <Info size={14}/>
+          <p>You were signed out because the session ended. Sign in again to pick up where you left off — nothing you had saved is lost.</p>
+        </div>}
         <form onSubmit={submit}>
           {tab==='register' && <label>Username<input autoComplete="username" value={form.name} onChange={e=>set({name:e.target.value})} placeholder="The name your team will see" required/></label>}
           <label>Work email<input autoComplete="email" type="email" value={form.email} onChange={e=>set({email:e.target.value})} placeholder={`name@${emailDomain || 'yourcompany.com'}`} required/></label>
@@ -585,6 +605,9 @@ function Auth({onReady}:{onReady:(u:User)=>void}) {
 function App() {
   const [user,setUser] = useState<User|null>(null);
   const [loading,setLoading] = useState(true);
+  // Set when a session ends underneath an open tab, so the sign-in screen can
+  // say what happened rather than just appearing.
+  const [sessionEnded,setSessionEnded] = useState(false);
   const [page,setPage] = useState<'chat'|'slides'|'tools'|'usage'|'admin'>('chat');
   const [mobileNav,setMobileNav] = useState(false);
   // Bumping this tells an already-mounted Chat to clear itself. It lives here
@@ -592,6 +615,21 @@ function App() {
   // Tools and Usage too, where Chat is not mounted to hear a window event.
   const [newChatToken,setNewChatToken] = useState(0);
   useEffect(()=>{ api('/api/me').then(setUser).catch(()=>{}).finally(()=>setLoading(false)); },[]);
+
+  // Read through a ref so the handler is registered once and still sees the
+  // current user. Without the guard the /api/me that runs at boot - a 401 for
+  // anybody not signed in yet - would announce an expired session to a first
+  // time visitor.
+  const signedIn = useRef(false);
+  signedIn.current = user !== null;
+  useEffect(()=>{
+    onSessionLost = ()=>{
+      if(!signedIn.current) return;
+      setUser(null);
+      setSessionEnded(true);
+    };
+    return ()=>{ onSessionLost = null; };
+  },[]);
 
   const startNewChat = useCallback(()=>{
     setPage('chat');
@@ -607,7 +645,7 @@ function App() {
     return ()=>window.removeEventListener('keydown',onKey);
   },[startNewChat]);
   if(loading) return <div className="boot"><Brand/></div>;
-  if(!user) return <Auth onReady={setUser}/>;
+  if(!user) return <Auth onReady={u=>{setSessionEnded(false);setUser(u)}} sessionEnded={sessionEnded}/>;
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav?'show':''}`}>
       <div className="sidebar-top"><Brand/><button className="mobile-close icon-button" onClick={()=>setMobileNav(false)}><X size={17}/></button></div>

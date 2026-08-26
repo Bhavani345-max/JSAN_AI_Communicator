@@ -770,18 +770,53 @@ class ChatUserError extends Error {}
 function getUserById(id) {
   return db.prepare('SELECT * FROM jsan_users WHERE id=?').get(id) || null;
 }
+/** The account behind the session cookie, with the claims that carried it. */
 async function sessionUser(req) {
   const token = req.cookies.jsan_session;
   if (!token) return null;
   try {
     const claims = jwt.verify(token, JWT_SECRET, { issuer: 'jsan-dev-ai' });
-    return getUserById(claims.sub);
+    const user = getUserById(claims.sub);
+    return user ? { user, claims } : null;
   } catch { return null; }
 }
+
+/**
+ * Renew a session that is being used.
+ *
+ * Without this a session is a fixed SESSION_HOURS from the moment somebody
+ * signed in, whatever they are doing when it runs out. An admin part way
+ * through issuing codes had their next click answered with "Sign in required"
+ * on a page that was still showing them signed in, which reads as the feature
+ * being broken rather than the session having ended.
+ *
+ * Renewed only in the second half of its life, so a busy portal is not
+ * re-signing a token on every request. This makes the window idle time rather
+ * than total time: someone actively working stays signed in, and a session
+ * nobody has touched for SESSION_HOURS still lapses, which is the part that
+ * matters for a shared or forgotten machine.
+ */
+function renewSessionIfStale(res, session) {
+  const expiresAt = Number(session.claims?.exp) * 1000;
+  if (!Number.isFinite(expiresAt)) return;
+  const halfLife = (SESSION_HOURS * 60 * 60 * 1000) / 2;
+  if (expiresAt - Date.now() > halfLife) return;
+  // Safe on the streaming routes too: `auth` runs before any handler writes a
+  // header, so the Set-Cookie is in place well before an SSE body starts.
+  setSessionCookie(res, createSession(session.user));
+}
+
 async function auth(req, res, next) {
-  const user = await sessionUser(req);
-  if (!user) return res.status(401).json({ error: 'Sign in required' });
-  req.user = user;
+  const session = await sessionUser(req);
+  if (!session) {
+    // `code` is what the browser keys on: it tells a 401 that means "your
+    // session has ended" apart from a 401 that means "that password is wrong",
+    // so the app can stop claiming to be signed in without treating a failed
+    // sign-in as a lost session.
+    return res.status(401).json({ error: 'Sign in required', code: 'session_expired' });
+  }
+  req.user = session.user;
+  renewSessionIfStale(res, session);
   next();
 }
 

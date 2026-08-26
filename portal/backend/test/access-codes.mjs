@@ -93,12 +93,77 @@ await new Promise(r => setTimeout(r, 1500));
 const admin = client();
 const dev = client();
 
+let adminId = null;
 await check('the seeded admin can sign in and is flagged as an admin', async () => {
   const { status, data } = await admin('POST', '/api/auth/login', { email: 'admindev@jsan.com', password: 'admindev@43' });
   assert.equal(status, 200, JSON.stringify(data));
   assert.equal(data.user.isAdmin, true, 'admin flag missing on login');
+  adminId = data.user.id;
   const me = await admin('GET', '/api/me');
   assert.equal(me.data.isAdmin, true, '/api/me does not report admin');
+});
+
+// Sessions.
+//
+// The bug these cover: a session ran out while the Admin page was open, the
+// browser dropped the cookie, and the next click - Generate - came back 401 on
+// a page that was still showing the admin as signed in. Two halves to the fix,
+// and both are checked here: a session being used is renewed before it can
+// lapse, and a 401 that means "your session ended" says so, so the app can put
+// the person back on the sign-in screen instead of showing a dead workspace.
+const forgeSession = async (expiresIn) => {
+  const { default: jwt } = await import('jsonwebtoken');
+  return jwt.sign({ sub: adminId, email: 'admindev@jsan.com', name: 'Admin' },
+    process.env.JWT_SECRET, { expiresIn, issuer: 'jsan-dev-ai' });
+};
+const withSession = (token) => realFetch(`${BASE}/api/admin/overview`, { headers: { Cookie: `jsan_session=${token}` } });
+
+await check('a session near the end of its life is renewed by using it', async () => {
+  // Five minutes left of a twelve hour session: well into the second half, so
+  // this request should hand back a fresh cookie rather than let it run out.
+  const res = await withSession(await forgeSession('5m'));
+  assert.equal(res.status, 200, 'the request was refused');
+  const renewed = (res.headers.getSetCookie() || []).filter(c => c.startsWith('jsan_session='));
+  assert.equal(renewed.length, 1, 'the session was not renewed');
+  assert.match(renewed[0], /HttpOnly/i, 'the renewed cookie lost HttpOnly');
+});
+
+await check('a fresh session is not re-signed on every request', async () => {
+  const res = await withSession(await forgeSession('12h'));
+  assert.equal(res.status, 200);
+  const renewed = (res.headers.getSetCookie() || []).filter(c => c.startsWith('jsan_session='));
+  assert.equal(renewed.length, 0, 'a session with hours left was needlessly reissued');
+});
+
+await check('a lapsed session is refused in a way the browser can act on', async () => {
+  const res = await withSession(await forgeSession('-1s'));
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  // The app keys on this to tell "your session ended" apart from a wrong
+  // password, which is also a 401 and must leave the sign-in form alone.
+  assert.equal(body.code, 'session_expired', JSON.stringify(body));
+});
+
+await check('a wrong password is not reported as a lost session', async () => {
+  const res = await realFetch(`${BASE}/api/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'developerai@jsan.com', password: 'not-the-password' })
+  });
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  assert.notEqual(body.code, 'session_expired', 'a bad password would sign the person out of another tab');
+});
+
+await check('generating codes works throughout one signed-in session', async () => {
+  // The whole point of the report: one login, several rounds of generating.
+  for (const round of [1, 2, 3]) {
+    const { status, data } = await admin('POST', '/api/admin/access-codes', {
+      assignedEmails: [`round${round}a@jsan.com`, `round${round}b@jsan.com`],
+      label: `Round ${round}`
+    });
+    assert.equal(status, 201, `round ${round} was refused: ${JSON.stringify(data)}`);
+    assert.equal(data.issued.length, 2, `round ${round} issued ${data.issued.length} codes`);
+  }
 });
 
 await check('a non-admin account is refused the admin routes', async () => {
