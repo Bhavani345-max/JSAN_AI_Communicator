@@ -8,7 +8,7 @@ import {
   Sun, Terminal, Trash2, Wrench, X, Zap, BrainCircuit, Bug, GitPullRequest,
   Blocks, BookOpenText, ShieldCheck, ExternalLink, CheckCircle2, Lock, TriangleAlert,
   Presentation, FileUp, LoaderCircle, Palette, Ticket, Plus, Ban, Eye, EyeOff,
-  Mail, Info, Users
+  Mail, Info, Users, LockOpen, UserMinus, UserCheck, ArrowLeft, MessagesSquare
 } from 'lucide-react';
 import 'highlight.js/styles/github-dark.css';
 import './styles.css';
@@ -144,10 +144,39 @@ async function* readEvents(body:ReadableStream<Uint8Array>):AsyncGenerator<Strea
   }
 }
 
+/**
+ * Copy that also works on a phone.
+ *
+ * navigator.clipboard exists only in a secure context, and the first thing
+ * somebody does with a portal like this is open it from their phone on the
+ * office network - over plain http, where the whole API is undefined. Every
+ * copy button then threw and did nothing, including the one that puts a
+ * developer key on the device. The textarea below is the old way of doing it,
+ * kept for exactly that case.
+ */
+async function copyText(value:string):Promise<boolean> {
+  try {
+    const clip = (navigator as any).clipboard;
+    if(clip?.writeText){ await clip.writeText(value); return true; }
+  } catch { /* not permitted here - fall through */ }
+  try {
+    const box=document.createElement('textarea');
+    box.value=value;
+    box.setAttribute('readonly','');
+    box.style.cssText='position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+    document.body.appendChild(box);
+    box.select();
+    box.setSelectionRange(0,value.length);
+    const ok=document.execCommand('copy');
+    box.remove();
+    return ok;
+  } catch { return false; }
+}
+
 function CopyButton({value,small=false}:{value:string;small?:boolean}) {
   const [done,setDone] = useState(false);
   return <button className={`icon-button ${small?'small':''}`} title="Copy" onClick={async()=>{
-    await navigator.clipboard.writeText(value); setDone(true); setTimeout(()=>setDone(false),1200);
+    if(await copyText(value)){ setDone(true); setTimeout(()=>setDone(false),1200); }
   }}>{done ? <Check size={14}/> : <Copy size={14}/>}</button>;
 }
 
@@ -359,7 +388,7 @@ function CodeBlock({children,node,...rest}:any){
       {drawn && <button onClick={()=>setShowSource(v=>!v)} title={showSource?'Show the diagram':'Show the mermaid source'}>
         <Code2 size={12}/>{showSource?'Diagram':'Source'}
       </button>}
-      <button onClick={async()=>{await navigator.clipboard.writeText(text);setCopied(true);setTimeout(()=>setCopied(false),1200)}}>
+      <button onClick={async()=>{if(await copyText(text)){setCopied(true);setTimeout(()=>setCopied(false),1200)}}}>
         {copied?<Check size={12}/>:<Copy size={12}/>}{copied?'Copied':'Copy'}
       </button>
       <button onClick={()=>downloadCode(text,language)} title="Save this block as a file">
@@ -436,9 +465,37 @@ function Brand({compact=false, invert=false, size='md'}:{compact?:boolean; inver
 }
 
 function ThemeButton(){
-  const [dark,setDark]=useState(()=>localStorage.getItem('jsan-theme')==='dark');
-  useEffect(()=>{document.documentElement.dataset.theme=dark?'dark':'light';localStorage.setItem('jsan-theme',dark?'dark':'light')},[dark]);
+  // Read through a try: a browser with site data blocked throws on the very
+  // first touch of localStorage, and thrown from a state initialiser that is a
+  // blank page rather than a portal in the wrong theme.
+  const [dark,setDark]=useState(()=>{ try { return localStorage.getItem('jsan-theme')==='dark'; } catch { return false; } });
+  useEffect(()=>{
+    document.documentElement.dataset.theme=dark?'dark':'light';
+    // Android paints the browser chrome with this. Left at white it framed the
+    // dark theme in a bright bar.
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content',dark?'#0d111b':'#ffffff');
+    try { localStorage.setItem('jsan-theme',dark?'dark':'light'); } catch {}
+  },[dark]);
   return <button className="icon-button" title={dark?'Use light theme':'Use dark theme'} onClick={()=>setDark(v=>!v)}>{dark?<Sun size={15}/>:<Moon size={15}/>}</button>
+}
+
+/**
+ * True where the primary pointer is a fingertip - a phone or a tablet. A laptop
+ * with a touchscreen reports a fine pointer as well and is deliberately not
+ * counted, because it has a real keyboard and a real Enter key.
+ */
+function useCoarsePointer(){
+  const query = '(pointer:coarse) and (hover:none)';
+  const [coarse,setCoarse] = useState(()=>{ try { return window.matchMedia(query).matches; } catch { return false; } });
+  useEffect(()=>{
+    let m:MediaQueryList;
+    try { m = window.matchMedia(query); } catch { return; }
+    const on = ()=>setCoarse(m.matches);
+    on();
+    m.addEventListener('change',on);
+    return ()=>m.removeEventListener('change',on);
+  },[]);
+  return coarse;
 }
 
 type AlertTone = 'warn' | 'lock';
@@ -478,8 +535,83 @@ function AuthAlert({state,secondsLeft,onClose}:{state:AuthAlertState;secondsLeft
   </div>;
 }
 
+// Which route each mode of the card posts to. Written out rather than built
+// from the mode name: `reset` posts to /api/auth/reset-password, and a
+// template string that happened to work for the other two would hide that.
+const AUTH_ROUTES = {
+  login: '/api/auth/login',
+  register: '/api/auth/register',
+  reset: '/api/auth/reset-password'
+} as const;
+
+/**
+ * Changing your own password, knowing the current one.
+ *
+ * Until this existed the only way to change a password was to ask an admin for
+ * a reset code - which puts a live code on a chat thread for something that
+ * needed no code at all, and made an ordinary act into an interruption.
+ *
+ * The current password is asked for because the session is what somebody finds
+ * at an unlocked desk; the password is the part they would have to know. The
+ * server asks for it again, because this form is not the only way to reach the
+ * route.
+ */
+function PasswordDialog({onClose}:{onClose:()=>void}) {
+  const [form,setForm] = useState({currentPassword:'',password:'',confirmPassword:''});
+  const [busy,setBusy] = useState(false);
+  const [error,setError] = useState('');
+  const [done,setDone] = useState(false);
+  useEffect(()=>{
+    const onKey = (e:KeyboardEvent)=>{ if(e.key==='Escape') onClose(); };
+    window.addEventListener('keydown',onKey);
+    return ()=>window.removeEventListener('keydown',onKey);
+  },[onClose]);
+  const set = (patch:Partial<typeof form>)=>setForm(f=>({...f,...patch}));
+  const mismatch = form.confirmPassword.length>0 && form.password!==form.confirmPassword;
+  const submit = async(e:React.FormEvent)=>{
+    e.preventDefault();
+    if(mismatch) return;
+    setBusy(true); setError('');
+    try { await api('/api/auth/change-password',{method:'POST',body:JSON.stringify(form)}); setDone(true); }
+    catch(err:any){ setError(err.message || 'Could not change the password'); }
+    finally { setBusy(false); }
+  };
+  return <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal form-modal" role="dialog" aria-modal="true" aria-labelledby="password-dialog-title" onClick={e=>e.stopPropagation()}>
+      {done
+        ? <>
+            <div className="modal-icon ok"><CheckCircle2 size={19}/></div>
+            <h3 id="password-dialog-title">Password changed</h3>
+            <p>Use the new password the next time you sign in. This tab stays signed in, and any reset code an admin issued you has stopped working.</p>
+            <button className="primary-button full" autoFocus onClick={onClose}>Done</button>
+          </>
+        : <>
+            <h3 id="password-dialog-title">Change your password</h3>
+            <p>You will need your current one. If you have forgotten it, sign out and use a reset code from your admin instead.</p>
+            <form onSubmit={submit}>
+              <label>Current password
+                <input autoComplete="current-password" type="password" value={form.currentPassword} onChange={e=>set({currentPassword:e.target.value})} required autoFocus/>
+              </label>
+              <label>New password
+                <input autoComplete="new-password" type="password" value={form.password} onChange={e=>set({password:e.target.value})} placeholder="At least 10 characters" required/>
+              </label>
+              <label>Re-enter new password
+                <input autoComplete="new-password" type="password" className={mismatch?'mismatch':''} value={form.confirmPassword} onChange={e=>set({confirmPassword:e.target.value})} required/>
+                {mismatch && <small className="field-hint">Both passwords must match.</small>}
+              </label>
+              {error && <div className="form-error">{error}</div>}
+              <div className="modal-actions">
+                <button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
+                <button className="primary-button" disabled={busy||mismatch}>{busy?'Please wait…':'Change password'}</button>
+              </div>
+            </form>
+          </>}
+    </div>
+  </div>;
+}
+
 function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnded?:boolean}) {
-  const [tab,setTab] = useState<'login'|'register'>('login');
+  const [tab,setTab] = useState<'login'|'register'|'reset'>('login');
   const [form,setForm] = useState({name:'',email:'',password:'',confirmPassword:'',accessCode:''});
   const [status,setStatus] = useState<any>(null);
   const [error,setError] = useState('');
@@ -503,21 +635,24 @@ function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnde
   const locked = secondsLeft>0;
 
   const set = (patch:Partial<typeof form>)=>setForm(f=>({...f,...patch}));
-  const mismatch = tab==='register' && form.confirmPassword.length>0 && form.password!==form.confirmPassword;
+  const needsConfirm = tab==='register' || tab==='reset';
+  const mismatch = needsConfirm && form.confirmPassword.length>0 && form.password!==form.confirmPassword;
 
   const submit = async(e:React.FormEvent)=>{
     e.preventDefault();
-    if(locked) return;
+    if(blocked) return;
     // Caught here so the person is told without a round trip. The server checks
     // it again, because this form is not the only way to reach the route.
-    if(tab==='register' && form.password!==form.confirmPassword){
+    if(needsConfirm && form.password!==form.confirmPassword){
       setAlert({tone:'warn',title:'Passwords do not match',body:'Type the same password into both fields, then try again.'});
       return;
     }
     setBusy(true); setError('');
-    const body = tab==='login' ? { email:form.email, password:form.password } : form;
+    const body = tab==='login' ? { email:form.email, password:form.password }
+      : tab==='reset' ? { email:form.email, code:form.accessCode, password:form.password, confirmPassword:form.confirmPassword }
+      : form;
     try {
-      const data = await api(`/api/auth/${tab}`,{method:'POST',body:JSON.stringify(body)});
+      const data = await api(AUTH_ROUTES[tab],{method:'POST',body:JSON.stringify(body)});
       onReady(data.user);
     } catch(err:any) {
       const payload = err?.payload || {};
@@ -544,9 +679,15 @@ function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnde
 
   const canRegister = status?.registrationOpen !== false;
   const emailDomain = status?.emailDomain;
-  const submitLabel = locked ? `Locked — ${clock(secondsLeft)}`
+  // A lockout stops a sign-in, not a reset: somebody holding a reset code has
+  // proved more than a password would, and being made to wait it out is what
+  // left developers stuck for half an hour with nobody able to help.
+  const blocked = locked && tab==='login';
+  const submitLabel = blocked ? `Locked — ${clock(secondsLeft)}`
     : busy ? 'Please wait…'
-    : tab==='login' ? 'Sign in' : 'Create account';
+    : tab==='login' ? 'Sign in'
+    : tab==='reset' ? 'Set new password'
+    : 'Create account';
 
   return <div className="auth-screen">
     <div className="auth-glow glow-a"/><div className="auth-glow glow-b"/>
@@ -568,14 +709,24 @@ function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnde
       </section>
       <section className="auth-card">
         <div className="auth-card-head">
-          <div><span className="eyebrow">JSAN Engineering</span><h2>{tab==='login' ? 'Welcome back' : 'Create your account'}</h2></div>
+          <div><span className="eyebrow">JSAN Engineering</span><h2>{
+            tab==='login' ? 'Welcome back' : tab==='reset' ? 'Set a new password' : 'Create your account'
+          }</h2></div>
           {tab==='register'&&status&&<span className="seat-pill">{status.remaining} seats left</span>}
         </div>
-        <p>{tab==='login' ? 'Continue where you left off.' : 'Use your work email and team access code.'}</p>
-        <div className="auth-tabs">
-          <button type="button" className={tab==='login'?'active':''} onClick={()=>{setTab('login');setError('')}}>Sign in</button>
-          <button type="button" disabled={!canRegister} className={tab==='register'?'active':''} onClick={()=>{setTab('register');setError('')}}>Register</button>
-        </div>
+        <p>{
+          tab==='login' ? 'Continue where you left off.'
+          : tab==='reset' ? 'Use the reset code your JSAN admin sent you.'
+          : 'Use your work email and team access code.'
+        }</p>
+        {tab==='reset'
+          ? <button type="button" className="auth-back" onClick={()=>{setTab('login');setError('');setForm(f=>({...f,accessCode:'',password:'',confirmPassword:''}))}}>
+              <ArrowLeft size={13}/>Back to sign in
+            </button>
+          : <div className="auth-tabs">
+              <button type="button" className={tab==='login'?'active':''} onClick={()=>{setTab('login');setError('')}}>Sign in</button>
+              <button type="button" disabled={!canRegister} className={tab==='register'?'active':''} onClick={()=>{setTab('register');setError('')}}>Register</button>
+            </div>}
         {sessionEnded && tab==='login' && <div className="auth-notice">
           <Info size={14}/>
           <p>You were signed out because the session ended. Sign in again to pick up where you left off — nothing you had saved is lost.</p>
@@ -583,8 +734,12 @@ function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnde
         <form onSubmit={submit}>
           {tab==='register' && <label>Username<input autoComplete="username" value={form.name} onChange={e=>set({name:e.target.value})} placeholder="The name your team will see" required/></label>}
           <label>Work email<input autoComplete="email" type="email" value={form.email} onChange={e=>set({email:e.target.value})} placeholder={`name@${emailDomain || 'yourcompany.com'}`} required/></label>
-          <label>Password<input autoComplete={tab==='login'?'current-password':'new-password'} type="password" value={form.password} onChange={e=>set({password:e.target.value})} placeholder="At least 10 characters" required/></label>
-          {tab==='register' && <label>Re-enter password
+          {tab==='reset' && <label>Reset code
+            <input value={form.accessCode} onChange={e=>set({accessCode:e.target.value})} placeholder="RESET-XXXXX-XXXXX-XXXXX" required/>
+            <small className="field-note">Your JSAN admin issues this and sends it to you. It works once.</small>
+          </label>}
+          <label>{tab==='reset' ? 'New password' : 'Password'}<input autoComplete={tab==='login'?'current-password':'new-password'} type="password" value={form.password} onChange={e=>set({password:e.target.value})} placeholder="At least 10 characters" required/></label>
+          {needsConfirm && <label>Re-enter password
             <input autoComplete="new-password" type="password" className={mismatch?'mismatch':''} value={form.confirmPassword} onChange={e=>set({confirmPassword:e.target.value})} placeholder="Type the same password again" required/>
             {mismatch && <small className="field-hint">Both passwords must match.</small>}
           </label>}
@@ -593,9 +748,12 @@ function Auth({onReady, sessionEnded=false}:{onReady:(u:User)=>void; sessionEnde
             <small className="field-note">Your JSAN admin generates this for your email address and sends it to you. Most codes work once, for the address they were issued to.</small>
           </label>}
           {error && <div className="form-error">{error}</div>}
-          {locked && <div className="form-error">Locked after {status?.maxAttempts ?? 3} failed attempts. You can try again in {clock(secondsLeft)}.</div>}
-          <button className="primary-button full" disabled={busy||locked||mismatch}>{submitLabel}</button>
+          {blocked && <div className="form-error">Locked after {status?.maxAttempts ?? 3} failed attempts. Wait {clock(secondsLeft)}, or ask your admin for a reset code.</div>}
+          <button className="primary-button full" disabled={busy||blocked||mismatch}>{submitLabel}</button>
         </form>
+        {tab==='login' && <button type="button" className="auth-link" onClick={()=>{setTab('reset');setError('');setForm(f=>({...f,password:'',confirmPassword:'',accessCode:''}))}}>
+          Forgotten your password, or locked out? Use a reset code
+        </button>}
         <div className="auth-security"><ShieldCheck size={14}/><span>Provider credentials are never exposed to developer devices.</span></div>
       </section>
     </main>
@@ -610,6 +768,7 @@ function App() {
   const [sessionEnded,setSessionEnded] = useState(false);
   const [page,setPage] = useState<'chat'|'slides'|'tools'|'usage'|'admin'>('chat');
   const [mobileNav,setMobileNav] = useState(false);
+  const [passwordOpen,setPasswordOpen] = useState(false);
   // Bumping this tells an already-mounted Chat to clear itself. It lives here
   // rather than in Chat because the shortcut and the button must work from
   // Tools and Usage too, where Chat is not mounted to hear a window event.
@@ -647,6 +806,7 @@ function App() {
   if(loading) return <div className="boot"><Brand/></div>;
   if(!user) return <Auth onReady={u=>{setSessionEnded(false);setUser(u)}} sessionEnded={sessionEnded}/>;
   return <div className="app-shell">
+    {mobileNav && <button className="drawer-scrim nav-scrim" aria-label="Close the menu" onClick={()=>setMobileNav(false)}/>}
     <aside className={`sidebar ${mobileNav?'show':''}`}>
       <div className="sidebar-top"><Brand/><button className="mobile-close icon-button" onClick={()=>setMobileNav(false)}><X size={17}/></button></div>
       <button className="new-chat" onClick={startNewChat}><MessageSquarePlus size={16}/><span>New chat</span><kbd>{SHORTCUT_LABEL}</kbd></button>
@@ -662,11 +822,18 @@ function App() {
         <div className="avatar">{user.name.split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase()}</div>
         <div className="who"><strong>{user.name}</strong><span>{user.email}</span></div>
         <ThemeButton/>
+        <button className="icon-button" title="Change your password" aria-label="Change your password" onClick={()=>setPasswordOpen(true)}><KeyRound size={15}/></button>
         <button className="icon-button" title="Sign out" onClick={async()=>{await api('/api/auth/logout',{method:'POST'});setUser(null)}}><LogOut size={15}/></button>
       </div>
     </aside>
     <main className="main-area">
-      <button className="mobile-menu icon-button" onClick={()=>setMobileNav(true)}><Menu size={18}/></button>
+      {/* Only drawn on a phone, where the sidebar - and with it the logo - is
+          a drawer. Without this the product is unbranded on mobile, and the
+          menu button floats over the page with nothing to sit in. */}
+      <header className="mobile-topbar">
+        <button className="mobile-menu icon-button" title="Menu" aria-label="Open the main menu" onClick={()=>setMobileNav(true)}><Menu size={18}/></button>
+        <Brand/>
+      </header>
       {/* Chat stays mounted so switching to Tools/Usage and back keeps the
           open conversation, the draft and the scroll position. */}
       <Chat newChatToken={newChatToken} hidden={page!=='chat'}/>
@@ -675,6 +842,7 @@ function App() {
       {page==='usage' && <UsagePage/>}
       {page==='admin' && user.isAdmin && <AdminPage/>}
     </main>
+    {passwordOpen && <PasswordDialog onClose={()=>setPasswordOpen(false)}/>}
   </div>;
 }
 
@@ -690,6 +858,7 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
   const [historyOpen,setHistoryOpen] = useState(false);
   const [search,setSearch] = useState('');
   const [attachments,setAttachments]=useState<Attachment[]>([]);
+  const touch = useCoarsePointer();
   // The answer currently arriving, and whether the model reasoned before it
   // started answering. Both are live-only and cleared when the turn ends. The
   // reasoning itself is never received, so nothing but the developer's own
@@ -888,10 +1057,33 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
     }
     finally { abortRef.current=null; setBusy(false); setStreamText(''); setThinking(false) }
   };
-  const del = async(e:React.MouseEvent,id:string)=>{e.stopPropagation();await api(`/api/conversations/${id}`,{method:'DELETE'});if(active===id){setActive(null);setMessages([])}refresh()};
+  // Asked first, and not only for the phone. Deleting a conversation takes its
+  // messages with it and there is no undo, and on a touch screen the icon that
+  // does it sits inside the row that opens the conversation.
+  const del = async(e:React.MouseEvent,id:string)=>{
+    e.stopPropagation();
+    const conv = convs.find(c=>c.id===id);
+    if(!confirm(`Delete "${conv?.title || 'this conversation'}"? The messages in it go too, and this cannot be undone.`)) return;
+    await api(`/api/conversations/${id}`,{method:'DELETE'});
+    if(active===id){setActive(null);setMessages([])}
+    refresh();
+  };
+
+  // Android's back gesture is a swipe in from the edge - the same edge the
+  // sidebar opens from - and it leaves the site. Warn only when there is
+  // something to lose: a typed message that has not been sent, or an answer
+  // still arriving.
+  const unsaved = input.trim().length>0 || busy;
+  useEffect(()=>{
+    if(!unsaved) return;
+    const warn=(e:BeforeUnloadEvent)=>{ e.preventDefault(); e.returnValue=''; };
+    window.addEventListener('beforeunload',warn);
+    return ()=>window.removeEventListener('beforeunload',warn);
+  },[unsaved]);
   const currentMode=MODES.find(m=>m.id===mode)!; const ModeIcon=currentMode.icon;
   const filtered=convs.filter(c=>c.title.toLowerCase().includes(search.toLowerCase()));
   return <div className={`chat-layout${hidden?' is-hidden':''}`}>
+    {historyOpen && <button className="drawer-scrim" aria-label="Close conversations" onClick={()=>setHistoryOpen(false)}/>}
     <aside className={`history ${historyOpen?'show':''}`}>
       <div className="history-head"><span>Conversations</span><button className="mobile-close icon-button" onClick={()=>setHistoryOpen(false)}><X size={15}/></button></div>
       <div className="history-search"><Search size={13}/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search"/></div>
@@ -899,7 +1091,7 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
     </aside>
     <section className="workspace">
       <header className="workspace-header">
-        <div className="workspace-left"><button className="history-toggle icon-button" onClick={()=>setHistoryOpen(true)}><Menu size={15}/></button><div className="status-dot"/><strong>{active?'Conversation':'New chat'}</strong></div>
+        <div className="workspace-left"><button className="history-toggle icon-button" title="Conversations" aria-label="Show conversations" onClick={()=>setHistoryOpen(true)}><MessagesSquare size={15}/></button><div className="status-dot"/><strong>{active?'Conversation':'New chat'}</strong></div>
         <div className="mode-select">
           <button onClick={()=>setModeOpen(v=>!v)}><ModeIcon size={14}/>{currentMode.label}<ChevronDown size={14}/></button>
           {modeOpen&&<div className="mode-menu">{MODES.map(m=>{const I=m.icon;return <button key={m.id} className={m.id===mode?'selected':''} onClick={()=>{setMode(m.id);setModeOpen(false)}}><I size={15}/><div><strong>{m.label}</strong><span>{m.hint}</span></div>{m.id===mode&&<Check size={14}/>}</button>})}</div>}
@@ -917,7 +1109,7 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
               {m.images?.length ? <div className="message-images">{m.images.map((img,j)=><img key={j} src={img.url} alt={img.name} title={img.name}/>)}</div> : null}
               {m.content}
             </div></div>
-          : <div className="assistant-message" key={i}><div className="assistant-icon"><Sparkles size={14}/></div><div className="markdown"><Answer content={m.content}/><button className="copy-answer" onClick={()=>navigator.clipboard.writeText(m.content)}><Copy size={12}/>Copy response</button></div></div>)}
+          : <div className="assistant-message" key={i}><div className="assistant-icon"><Sparkles size={14}/></div><div className="markdown"><Answer content={m.content}/><button className="copy-answer" onClick={()=>copyText(m.content)}><Copy size={12}/>Copy response</button></div></div>)}
         {busy&&<div className="assistant-message"><div className="assistant-icon"><Sparkles size={14}/></div>
           {streamText
             ? <div className="markdown"><Answer content={streamText} streaming/><span className="stream-caret"/></div>
@@ -934,8 +1126,19 @@ function Chat({newChatToken=0, hidden=false}:{newChatToken?:number; hidden?:bool
             {a.name}
             <button onClick={()=>setAttachments(x=>x.filter((_,j)=>j!==i))}><X size={11}/></button>
           </span>)}</div>}
-          <textarea ref={composerRef} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}} placeholder="Ask about code, bugs, architecture or implementation…" rows={1}/>
-          <div className="composer-foot"><div className="composer-actions"><input ref={fileRef} type="file" accept={ATTACH_ACCEPT} multiple hidden onChange={e=>pickFiles(e.target.files)}/><button className="composer-tool" title="Attach code, text or a screenshot" onClick={()=>fileRef.current?.click()}><Paperclip size={14}/><span>Attach</span></button><span className="mode-label"><ModeIcon size={12}/>{currentMode.label}</span></div><div className="send-side"><span>{busy?'Streaming':'Enter to send'}</span>{busy
+          <textarea ref={composerRef} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{
+            if(e.key!=='Enter'||e.shiftKey) return;
+            // An IME - Gboard's suggestion strip included - sends Enter to
+            // accept the word being composed. Sending there posts half a
+            // sentence.
+            if((e.nativeEvent as any).isComposing) return;
+            // And on a phone keyboard Enter is the only way to type a new line
+            // at all: there is no Shift to hold. The send button is an inch
+            // away, so Enter stays a newline.
+            if(touch) return;
+            e.preventDefault(); send();
+          }} placeholder="Ask about code, bugs, architecture or implementation…" rows={1}/>
+          <div className="composer-foot"><div className="composer-actions"><input ref={fileRef} type="file" accept={ATTACH_ACCEPT} multiple hidden onChange={e=>pickFiles(e.target.files)}/><button className="composer-tool" title="Attach code, text or a screenshot" onClick={()=>fileRef.current?.click()}><Paperclip size={14}/><span>Attach</span></button><span className="mode-label"><ModeIcon size={12}/>{currentMode.label}</span></div><div className="send-side"><span>{busy?'Streaming':touch?'Tap to send':'Enter to send'}</span>{busy
               ? <button className="send-button stop" title="Stop generating" onClick={()=>abortRef.current?.abort()}><Square size={12}/></button>
               : <button className="send-button" disabled={!input.trim()&&!attachments.length} onClick={()=>send()}><ArrowUp size={16}/></button>}</div></div>
         </div>
@@ -1228,15 +1431,25 @@ type AccessCode = {
 type IssuedCode = { email:string|null; code:string; entry:AccessCode };
 type SkippedEmail = { email:string; error:string };
 type IssueResult = { issued:IssuedCode[]; skipped:SkippedEmail[]; warning:string|null };
-/** A registered developer, and the code that let them in. */
+/** A live password reset an admin has issued for one developer. */
+type PasswordReset = {
+  id:string; code:string|null; readable:boolean; hint:string; expiresAt:string; createdAt:string;
+};
+/** A registered developer, the code that let them in, and what can be done about them. */
 type AdminUser = {
   id:string; name:string; email:string; createdAt:string; lastLoginAt:string|null; isAdmin:boolean;
   admittedBy:'issued-code'|'seed-account'|'shared-code';
   redeemedAt:string|null; accessCode:AccessCode|null;
+  /** Set while a sign-in lockout is running. */
+  lockedUntil:string|null;
+  /** Set once the seat has been given up. The account and its work stay. */
+  disabledAt:string|null;
+  passwordReset:PasswordReset|null;
+  canResetPassword:boolean; canDeactivate:boolean;
 };
 type AdminOverview = {
   registeredUsers:number; maxUsers:number; seatsRemaining:number; registrationOpen:boolean;
-  activeCodes:number; totalCodes:number; outstandingCodeUses:number;
+  activeCodes:number; totalCodes:number; outstandingCodeUses:number; deactivatedUsers:number;
   emailDomain:string|null; sharedCodeEnabled:boolean;
   admins:string[]; limits:{defaultExpiryDays:number; maxUses:number; maxExpiryDays:number};
 };
@@ -1292,6 +1505,23 @@ function inviteMessage(code:string, entry:AccessCode) {
       ? `It works until ${shortDate(entry.expiresAt)} and can be used ${timesUsed}.`
       : `It can be used ${timesUsed}.`,
     'Please do not forward it — it was issued to you.'
+  ].join('\n');
+}
+
+/** The message that goes with a password reset. */
+function resetMessage(code:string, user:AdminUser) {
+  const expires = user.passwordReset?.expiresAt;
+  return [
+    'Your JSAN Dev AI password can be reset.',
+    '',
+    `1. Open ${window.location.origin}`,
+    '2. On the sign-in card, choose "Use a reset code"',
+    `3. Enter ${user.email} and this reset code:`,
+    '',
+    `   ${code}`,
+    '',
+    'Then choose your new password.',
+    expires ? `The code works once, and stops working at ${new Date(expires).toLocaleString()}.` : 'The code works once.'
   ].join('\n');
 }
 
@@ -1366,6 +1596,40 @@ function AdminPage() {
     finally { setBusy(false); }
   };
 
+  // --- what an admin can do about one developer ---------------------------
+  //
+  // Each reloads the list afterwards rather than patching a row in place: the
+  // server decides what is now possible for that account - whether a reset can
+  // be issued, whether the seat can be given up - and re-reading is how the
+  // page stays in agreement with it.
+
+  const resetPassword = async(user:AdminUser)=>{
+    if(!confirm(`Issue a password reset for ${user.name}? Any reset code they already hold stops working.`)) return;
+    setError('');
+    try { await api(`/api/admin/users/${user.id}/password-reset`,{method:'POST'}); await load(); }
+    catch(e:any){ setError(e.message); }
+  };
+
+  const unlock = async(user:AdminUser)=>{
+    setError('');
+    try { await api(`/api/admin/users/${user.id}/unlock`,{method:'POST'}); await load(); }
+    catch(e:any){ setError(e.message); }
+  };
+
+  const deactivate = async(user:AdminUser)=>{
+    if(!confirm(`Deactivate ${user.name}?\n\nTheir seat is freed and their developer key stops working immediately. Their conversations are kept, and you can restore the account later.`)) return;
+    setError('');
+    try { await api(`/api/admin/users/${user.id}/deactivate`,{method:'POST'}); await load(); }
+    catch(e:any){ setError(e.message); }
+  };
+
+  const restore = async(user:AdminUser)=>{
+    if(!confirm(`Restore ${user.name}? They take a seat again and are issued a new developer key — the old one stays dead.`)) return;
+    setError('');
+    try { await api(`/api/admin/users/${user.id}/restore`,{method:'POST'}); await load(); }
+    catch(e:any){ setError(e.message); }
+  };
+
   const revoke = async(entry:AccessCode)=>{
     if(!confirm(`Withdraw ${entry.hint}? Anyone still holding it will be refused at registration.`)) return;
     setError('');
@@ -1434,6 +1698,7 @@ function AdminPage() {
       <section className="metric-card"><span>Seats remaining</span><strong>{overview?.seatsRemaining ?? 0}</strong><small>Of {overview?.maxUsers ?? 0} configured</small></section>
       <section className="metric-card"><span>Codes ready to send</span><strong>{overview?.activeCodes ?? 0}</strong><small>{overview?.totalCodes ?? 0} issued in total</small></section>
       <section className="metric-card"><span>Seats already promised</span><strong>{overview?.outstandingCodeUses ?? 0}</strong><small>{overCapacity ? 'More than the seats left' : 'Codes issued but not yet used'}</small></section>
+      {(overview?.deactivatedUsers ?? 0) > 0 && <section className="metric-card span-2"><span>Deactivated accounts</span><strong>{overview?.deactivatedUsers}</strong><small>Seats given up. Conversations kept, and each can be restored.</small></section>}
 
       {/* ---- Generate --------------------------------------------------- */}
       <section className="card span-2">
@@ -1481,13 +1746,13 @@ function AdminPage() {
             <div className="issue-head">
               <strong>{result.issued.length === 1 ? 'Send this code to the developer it is for' : `${result.issued.length} codes — send each one to the developer it names`}</strong>
               {result.issued.length > 1 && <button type="button" className="text-button"
-                onClick={()=>navigator.clipboard.writeText(batchAsRows(result.issued))}>Copy all as a list</button>}
+                onClick={()=>copyText(batchAsRows(result.issued))}>Copy all as a list</button>}
             </div>
             <div className="issued-list">{result.issued.map(one=><div key={one.entry.id} className="issued-row">
               <div className="issued-who">{one.email || 'Anyone on the team'}</div>
               <div className="issued-code-value">{codeCell(one.entry,'large')}</div>
               <button type="button" className="secondary-button" title="Copy a ready-written message for this developer"
-                onClick={()=>navigator.clipboard.writeText(inviteMessage(one.code,one.entry))}><Mail size={13}/>Message</button>
+                onClick={()=>copyText(inviteMessage(one.code,one.entry))}><Mail size={13}/>Message</button>
             </div>)}</div>
           </>}
 
@@ -1514,7 +1779,7 @@ function AdminPage() {
             <div><h2>Developers</h2><p>Everyone with a seat, and the access code that let them in.</p></div>
           </div>
           <div className="head-actions">
-            {users.length>0 && <button className="secondary-button" onClick={()=>navigator.clipboard.writeText(everyonesCodes())}>
+            {users.length>0 && <button className="secondary-button" onClick={()=>copyText(everyonesCodes())}>
               <Copy size={14}/>Copy every code
             </button>}
             <button className="secondary-button" onClick={()=>setShowCodes(v=>!v)}>
@@ -1525,24 +1790,51 @@ function AdminPage() {
 
         {users.length === 0
           ? <div className="admin-empty">Nobody has registered yet.</div>
-          : <div className="code-list">{users.map(user=><div key={user.id} className="code-row">
+          : <div className="code-list">{users.map(user=><div key={user.id} className={`code-row ${user.disabledAt?'is-disabled':''}`}>
               <div className="code-main">
                 <div className="code-id">
                   <strong className="user-name">{user.name}</strong>
                   <span className="code-for"><Mail size={11}/>{user.email}</span>
                   {user.isAdmin && <span className="status-pill admin">Admin</span>}
+                  {user.disabledAt && <span className="status-pill revoked">Deactivated</span>}
+                  {user.lockedUntil && !user.disabledAt && <span className="status-pill locked">Locked out</span>}
                 </div>
                 <div className="code-meta">
                   <span title={ADMITTED_NOTE[user.admittedBy]}>{ADMITTED_TEXT[user.admittedBy]}</span>
                   <span>Joined {shortDate(user.createdAt)}</span>
                   {user.lastLoginAt && <span>Last signed in {shortDate(user.lastLoginAt)}</span>}
-                  {user.accessCode?.label && <span>{user.accessCode.label}</span>}
+                  {user.disabledAt && <span>Seat given up {shortDate(user.disabledAt)} — conversations kept</span>}
+                  {user.lockedUntil && !user.disabledAt && <span>Locked until {new Date(user.lockedUntil).toLocaleTimeString()}</span>}
                 </div>
+                {user.passwordReset && <div className="user-reset">
+                  <span className="user-reset-label">Reset code</span>
+                  {user.passwordReset.readable
+                    ? <>
+                        <code className={`code-value ${showCodes?'':'code-hidden'}`}>
+                          {showCodes ? user.passwordReset.code : (user.passwordReset.code as string).replace(/[^-]/g,'•')}
+                        </code>
+                        <CopyButton value={user.passwordReset.code as string} small/>
+                        <button type="button" className="text-button" title="Copy a ready-written message for this developer"
+                          onClick={()=>copyText(resetMessage(user.passwordReset!.code as string,user))}>Message</button>
+                      </>
+                    : <span className="code-unreadable">Cannot be read back</span>}
+                  <span className="user-reset-expiry">expires {shortDate(user.passwordReset.expiresAt)}</span>
+                </div>}
               </div>
               <div className="code-actions user-code">
                 {user.accessCode
                   ? codeCell(user.accessCode)
                   : <span className="code-none" title={ADMITTED_NOTE[user.admittedBy]}>No issued code</span>}
+                <span className="action-divider"/>
+                {user.lockedUntil && !user.disabledAt &&
+                  <button className="icon-button small" title="Lift the sign-in lockout" onClick={()=>unlock(user)}><LockOpen size={14}/></button>}
+                {user.canResetPassword &&
+                  <button className="icon-button small" title="Issue a password reset code" onClick={()=>resetPassword(user)}><KeyRound size={14}/></button>}
+                {user.disabledAt
+                  ? <button className="icon-button small" title="Restore this account and its seat" onClick={()=>restore(user)}><UserCheck size={14}/></button>
+                  : user.canDeactivate
+                    ? <button className="icon-button small" title="Give up this seat — keeps their conversations" onClick={()=>deactivate(user)}><UserMinus size={14}/></button>
+                    : <button className="icon-button small" disabled title={user.isAdmin?'Admin accounts cannot be deactivated here — remove the address from ADMIN_EMAILS first':'This account cannot be deactivated'}><UserMinus size={14}/></button>}
               </div>
             </div>)}</div>}
       </section>
@@ -1579,7 +1871,7 @@ function AdminPage() {
               </div>
               <div className="code-actions">
                 {entry.readable && entry.status==='active' && <button className="icon-button small" title="Copy the message to send"
-                  onClick={()=>navigator.clipboard.writeText(inviteMessage(entry.code as string,entry))}><Mail size={14}/></button>}
+                  onClick={()=>copyText(inviteMessage(entry.code as string,entry))}><Mail size={14}/></button>}
                 {entry.status!=='revoked' && <button className="icon-button small" title="Withdraw this code" onClick={()=>revoke(entry)}><Ban size={14}/></button>}
                 <button className="icon-button small" title="Delete this code" onClick={()=>remove(entry)}><Trash2 size={14}/></button>
               </div>

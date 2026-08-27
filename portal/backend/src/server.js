@@ -297,6 +297,32 @@ const registerLimiter = rateLimit({
   message: { error: 'Too many registration attempts from this network. Try again later.' }
 });
 
+// Password resets: per network, like registration, and for the same reason -
+// the code is the control, and this only slows down guessing at one. Sized well
+// below registration because a reset is a rarer event than onboarding a team.
+const resetLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: byIp,
+  message: { error: 'Too many reset attempts from this network. Try again later.' }
+});
+
+// Changing your own password: per account, not per network. The session says
+// who this is, so the network is the wrong thing to count - and the guessing
+// this slows down is somebody at an unlocked desk trying the current password,
+// which is a per-account attack. Sized so a genuine mistyped attempt or three
+// never gets in the way.
+const passwordChangeLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id ?? byIp(req),
+  message: { error: 'Too many password changes attempted. Try again later.' }
+});
+
 // Fair use: how many model calls one developer may have running at once.
 //
 // The rate limiters above cap how often a turn may *start*; neither caps how
@@ -433,8 +459,8 @@ const CODE_REFUSALS = {
   wrongEmail: 'That access code was issued for a different email address.'
 };
 
-/** A fresh code, in the JSAN-XXXXX-XXXXX-XXXXX shape the admin page shows. */
-function newAccessCode() {
+/** A fresh code, in the PREFIX-XXXXX-XXXXX-XXXXX shape the admin page shows. */
+function newCode(prefix) {
   const groups = [];
   for (let group = 0; group < CODE_GROUPS; group++) {
     let text = '';
@@ -443,8 +469,20 @@ function newAccessCode() {
     for (let i = 0; i < CODE_GROUP_SIZE; i++) text += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
     groups.push(text);
   }
-  return `JSAN-${groups.join('-')}`;
+  return `${prefix}-${groups.join('-')}`;
 }
+
+/** A code that admits somebody to a seat. */
+const newAccessCode = () => newCode('JSAN');
+
+// A reset code carries the same 74 bits, under a prefix nobody can mistake for
+// a seat invitation: the two arrive by the same channel, are typed into forms
+// on the same card, and doing the wrong one with the wrong code should read as
+// an obvious mistake rather than a puzzling refusal.
+const newResetCode = () => newCode('RESET');
+// Short by design. A reset is a live credential for one account that somebody
+// is waiting on, not an invitation left open for a fortnight.
+const RESET_EXPIRY_HOURS = 24;
 
 /**
  * The form a code is matched in.
@@ -547,6 +585,82 @@ function checkAccessCode(submitted, email) {
 /** Is this signed-in account allowed to issue codes? */
 function isAdmin(user) {
   return !!user && ADMIN_EMAILS.has(String(user.email || '').toLowerCase());
+}
+
+// ---------------------------------------------------------------------------
+// Seats
+//
+// A disabled account keeps its row, its conversations and its messages, and
+// gives up only the two things a departure is actually about: the seat, and the
+// gateway key. So every question of the form "how many seats are in use?" has
+// to ask about accounts that are not disabled, never about rows in jsan_users.
+// ---------------------------------------------------------------------------
+
+/** Accounts holding a seat right now. */
+function activeUserCount() {
+  return db.prepare(`SELECT COUNT(*) AS count FROM jsan_users u
+    WHERE NOT EXISTS (SELECT 1 FROM jsan_disabled_users d WHERE d.user_id = u.id)`).get().count;
+}
+
+/** The deactivation record for an account, or null while it holds a seat. */
+function disabledRecord(userId) {
+  return db.prepare('SELECT * FROM jsan_disabled_users WHERE user_id=?').get(userId) || null;
+}
+
+/**
+ * Why this account may not be deactivated, or null when it may.
+ *
+ * Admins are refused outright. Deactivating the account you are signed in as
+ * would close the Admin page behind you with no route back, and deactivating
+ * another admin lets two people lock each other out of the only page that can
+ * undo it. Taking the address out of ADMIN_EMAILS first is the deliberate act
+ * that makes it possible.
+ */
+function deactivationProblem(user) {
+  if (isAdmin(user)) {
+    return 'This is an admin account. Remove the address from ADMIN_EMAILS first, then deactivate it.';
+  }
+  return null;
+}
+
+/**
+ * Why this account's password cannot be reset here, or null when it can.
+ *
+ * A seeded account's password is configuration: ensureSeedAccounts puts it back
+ * at every boot, so a reset would hold only until the next deploy and then
+ * silently undo itself. Refusing says so, which is more use than a reset that
+ * appears to work.
+ */
+function passwordResetProblem(user) {
+  const seeded = SEED_ACCOUNTS.some(account => account.email === String(user.email).toLowerCase());
+  if (seeded) {
+    return 'This account\'s password is set in SEED_ACCOUNTS and is reapplied at every restart. Change it there instead.';
+  }
+  return null;
+}
+
+/** The live reset for an account, or null. Expiry is judged on read. */
+function livePasswordReset(userId, now = Date.now()) {
+  const row = db.prepare(`SELECT * FROM jsan_password_resets
+    WHERE user_id=? AND used_at IS NULL AND revoked_at IS NULL
+    ORDER BY created_at DESC LIMIT 1`).get(userId);
+  if (!row) return null;
+  return Date.parse(row.expires_at) > now ? row : null;
+}
+
+/** The admin page's view of a reset. Carries the code, as the code list does. */
+function serializePasswordReset(row) {
+  let code = null;
+  try { code = decryptText({ ciphertext: row.code_ciphertext, iv: row.code_iv, tag: row.code_tag }); }
+  catch { code = null; }
+  return {
+    id: row.id,
+    code,
+    readable: code !== null,
+    hint: row.code_hint,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at
+  };
 }
 // A shared daily allowance that is spent behaves nothing like a momentary burst
 // limit: no amount of retrying clears it. Telling someone to "try again in a
@@ -806,8 +920,18 @@ function renewSessionIfStale(res, session) {
   setSessionCookie(res, createSession(session.user));
 }
 
+// Told to the developer rather than a generic refusal: somebody whose account
+// was closed on purpose should be able to tell that apart from a fault.
+const DISABLED_MESSAGE = 'This account has been deactivated. Contact your JSAN admin.';
+
 async function auth(req, res, next) {
   const session = await sessionUser(req);
+  if (session && disabledRecord(session.user.id)) {
+    // Checked on every request rather than only at sign-in, so a session that
+    // was already open when the account was closed stops working at once.
+    res.clearCookie('jsan_session', { path: '/' });
+    return res.status(401).json({ error: DISABLED_MESSAGE, code: 'account_disabled' });
+  }
   if (!session) {
     // `code` is what the browser keys on: it tells a 401 that means "your
     // session has ended" apart from a 401 that means "that password is wrong",
@@ -845,7 +969,7 @@ app.get('/api/health', async (_req, res) => {
   // Named dbOk because `db` at module scope is the connection itself.
   let dbOk = false, gateway = false, registeredUsers = 0;
   try {
-    registeredUsers = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get().count;
+    registeredUsers = activeUserCount();
     dbOk = true;
   } catch {}
   try {
@@ -856,7 +980,7 @@ app.get('/api/health', async (_req, res) => {
 });
 
 app.get('/api/auth/registration-status', (_req, res) => {
-  const { count } = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get();
+  const count = activeUserCount();
   // The sign-in policy travels with this so the form can state the rule
   // before anyone breaks it, and name the right domain wherever it is deployed.
   res.json({
@@ -894,11 +1018,18 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
 
   // Cheap pre-checks so an obviously doomed signup never reaches LiteLLM. They
   // are advisory only; the authoritative versions run under the write lock below.
-  if (db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get().count >= MAX_USERS) {
+  if (activeUserCount() >= MAX_USERS) {
     return res.status(409).json({ error: 'Registration is full' });
   }
-  if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email)) {
-    return res.status(409).json({ error: 'An account already exists for this email' });
+  const priorAccount = db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email);
+  if (priorAccount) {
+    // Registering again would not work anyway - the address is unique - and
+    // "an account already exists" sends somebody looking for a password they
+    // never had. Restoring the account is the actual repair, and it keeps the
+    // conversations the deactivation preserved.
+    return res.status(409).json(disabledRecord(priorAccount.id)
+      ? { error: 'That account was deactivated. Ask your JSAN admin to restore it rather than registering again.' }
+      : { error: 'An account already exists for this email' });
   }
 
   // Provisioning is a network call, so it cannot sit inside the transaction the
@@ -923,7 +1054,7 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
       // BEGIN IMMEDIATE takes the single writer lock for the whole block, so a
       // concurrent signup cannot pass the same seat check. This is the job
       // pg_advisory_xact_lock did before.
-      if (db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get().count >= MAX_USERS) {
+      if (activeUserCount() >= MAX_USERS) {
         throw new RegistrationConflict('Registration is full');
       }
       if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email)) {
@@ -1069,6 +1200,13 @@ app.post('/api/auth/login', loginIpLimiter, async (req, res) => {
     });
   }
 
+  // After the password check, not before it: answering faster for a
+  // deactivated address would say which addresses have accounts behind them.
+  if (disabledRecord(user.id)) {
+    clearLoginFailures(email);
+    return res.status(403).json({ error: DISABLED_MESSAGE, code: 'account_disabled' });
+  }
+
   clearLoginFailures(email);
   db.prepare('UPDATE jsan_users SET last_login_at=? WHERE id=?').run(nowIso(), user.id);
   setSessionCookie(res, createSession(user));
@@ -1127,7 +1265,7 @@ function accessCodeById(id) {
 }
 
 app.get('/api/admin/overview', auth, adminOnly, adminLimiter, (_req, res) => {
-  const { count } = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get();
+  const count = activeUserCount();
   const codes = db.prepare('SELECT revoked_at, expires_at, uses, max_uses FROM jsan_access_codes').all();
   const now = Date.now();
   const active = codes.filter(row => accessCodeStatus(row, now) === 'active').length;
@@ -1138,6 +1276,7 @@ app.get('/api/admin/overview', auth, adminOnly, adminLimiter, (_req, res) => {
     registrationOpen: count < MAX_USERS,
     activeCodes: active,
     totalCodes: codes.length,
+    deactivatedUsers: db.prepare('SELECT COUNT(*) AS count FROM jsan_disabled_users').get().count,
     // Seats already promised to somebody holding a code they have not spent.
     // Shown beside the seat count so an admin can see the portal running out
     // before a developer is the one to discover it.
@@ -1201,7 +1340,12 @@ function assignedEmailProblem(email) {
   if (ALLOWED_EMAIL_DOMAIN && !email.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) {
     return `Registration only accepts ${ALLOWED_EMAIL_DOMAIN} addresses`;
   }
-  if (db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email)) return 'Already has an account';
+  const account = db.prepare('SELECT id FROM jsan_users WHERE email=?').get(email);
+  if (account) {
+    return disabledRecord(account.id)
+      ? 'Deactivated - restore the account instead of issuing a code'
+      : 'Already has an account';
+  }
   // A second live code for one person is almost always the form submitted
   // twice rather than a deliberate reissue, and both would work - leaving a
   // spare seat nobody is tracking. Withdrawing the first is the explicit way
@@ -1298,7 +1442,7 @@ app.post('/api/admin/access-codes', auth, adminOnly, adminLimiter, (req, res) =>
   // and refusing to issue one would be the wrong call. Registration still
   // stops at MAX_USERS, so without this the admin would find out by way of a
   // developer being turned away.
-  const registered = db.prepare('SELECT COUNT(*) AS count FROM jsan_users').get().count;
+  const registered = activeUserCount();
   const outstanding = outstandingCodeUses();
   const warning = registered + outstanding > MAX_USERS
     ? `${registered} of ${MAX_USERS} seats are taken and ${outstanding} unused code uses are outstanding. Whoever arrives after the last seat will be refused.`
@@ -1340,6 +1484,9 @@ app.get('/api/admin/users', auth, adminOnly, adminLimiter, (_req, res) => {
     users: users.map(user => {
       const redemption = byUser.get(user.id);
       const address = String(user.email).toLowerCase();
+      const lock = loginLock(user.email);
+      const disabled = disabledRecord(user.id);
+      const reset = livePasswordReset(user.id);
       return {
         id: user.id,
         name: user.name,
@@ -1349,10 +1496,278 @@ app.get('/api/admin/users', auth, adminOnly, adminLimiter, (_req, res) => {
         isAdmin: ADMIN_EMAILS.has(address),
         admittedBy: redemption ? 'issued-code' : (seeded.has(address) ? 'seed-account' : 'shared-code'),
         redeemedAt: redemption?.redeemed_at || null,
-        accessCode: redemption ? serializeAccessCode(redemption) : null
+        accessCode: redemption ? serializeAccessCode(redemption) : null,
+        // What an admin can do something about, and why they cannot always.
+        lockedUntil: lock?.until || null,
+        disabledAt: disabled?.disabled_at || null,
+        passwordReset: reset ? serializePasswordReset(reset) : null,
+        canResetPassword: !disabled && passwordResetProblem(user) === null,
+        canDeactivate: !disabled && deactivationProblem(user) === null
       };
     })
   });
+});
+
+/**
+ * Look up the developer an admin action names.
+ *
+ * Returns null and answers 404 itself, so each route below is one line of
+ * lookup rather than five of the same guard.
+ */
+function adminTargetUser(req, res) {
+  const user = getUserById(req.params.id);
+  if (!user) { res.status(404).json({ error: 'That developer no longer has an account here' }); return null; }
+  return user;
+}
+
+/**
+ * Issue a password reset for one developer.
+ *
+ * Any reset still outstanding for them is revoked in the same breath, so there
+ * is never more than one live code for an account - two would both work, and
+ * the admin would have no way to tell which one they had sent.
+ */
+app.post('/api/admin/users/:id/password-reset', auth, adminOnly, adminLimiter, (req, res) => {
+  const user = adminTargetUser(req, res);
+  if (!user) return;
+  if (disabledRecord(user.id)) {
+    return res.status(409).json({ error: 'That account is deactivated. Restore it first, then reset the password.' });
+  }
+  const problem = passwordResetProblem(user);
+  if (problem) return res.status(409).json({ error: problem });
+
+  const id = crypto.randomUUID();
+  const code = newResetCode();
+  const encrypted = encryptText(code);
+  const expiresAt = new Date(Date.now() + RESET_EXPIRY_HOURS * 60 * 60 * 1000).toISOString();
+  try {
+    transaction(db, () => {
+      db.prepare('UPDATE jsan_password_resets SET revoked_at=? WHERE user_id=? AND used_at IS NULL AND revoked_at IS NULL')
+        .run(nowIso(), user.id);
+      db.prepare(`INSERT INTO jsan_password_resets(id,user_id,email,code_hash,code_ciphertext,code_iv,code_tag,code_hint,expires_at,created_by)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`)
+        .run(id, user.id, user.email, accessCodeDigest(code), encrypted.ciphertext, encrypted.iv, encrypted.tag,
+             accessCodeHint(code), expiresAt, req.user.id);
+    });
+  } catch (e) {
+    console.error('Could not issue a password reset:', e.message);
+    return res.status(500).json({ error: 'Could not issue the reset. Nothing was changed - try again.' });
+  }
+  console.log(`Password reset ${accessCodeHint(code)} issued by ${req.user.email} for ${user.email}`);
+  res.status(201).json({
+    code,
+    reset: serializePasswordReset(db.prepare('SELECT * FROM jsan_password_resets WHERE id=?').get(id)),
+    email: user.email,
+    expiresInHours: RESET_EXPIRY_HOURS
+  });
+});
+
+/**
+ * Lift a sign-in lockout.
+ *
+ * The lockout is deliberately durable - it is counted in the database so a
+ * restart cannot clear it - which also meant nobody could clear it. Three
+ * mistyped passwords cost a developer half an hour with no way for anyone to
+ * help. This is that way.
+ */
+app.post('/api/admin/users/:id/unlock', auth, adminOnly, adminLimiter, (req, res) => {
+  const user = adminTargetUser(req, res);
+  if (!user) return;
+  const lock = loginLock(user.email);
+  clearLoginFailures(user.email);
+  console.log(`Sign-in lockout cleared for ${user.email} by ${req.user.email}`);
+  res.json({ ok: true, wasLocked: Boolean(lock) });
+});
+
+/**
+ * Give up a developer's seat without destroying anything they did.
+ *
+ * Their key is deleted at the gateway first: that is the half that matters the
+ * day somebody leaves, and if it fails the seat is left alone rather than
+ * marked free while the key still works. The account, its conversations and its
+ * messages all stay exactly where they are.
+ */
+app.post('/api/admin/users/:id/deactivate', auth, adminOnly, adminLimiter, async (req, res) => {
+  const user = adminTargetUser(req, res);
+  if (!user) return;
+  if (disabledRecord(user.id)) return res.status(409).json({ error: 'That account is already deactivated' });
+  const problem = deactivationProblem(user);
+  if (problem) return res.status(409).json({ error: problem });
+
+  try {
+    await litellmFetch('/key/delete', { method: 'POST', body: { key_aliases: [`jsan-${user.email}`] } });
+  } catch (e) {
+    // A key the gateway has already lost is not a reason to refuse: the state
+    // being asked for is "this key does not work", and it does not.
+    if (!/not found|does not exist|no keys/i.test(String(e.message))) {
+      console.error(`Could not revoke the gateway key for ${user.email}:`, e.message);
+      return res.status(502).json({ error: cleanError(e, 'Could not revoke their gateway key, so the seat was left as it was. Try again.') });
+    }
+    console.log(`Gateway key for ${user.email} was already gone`);
+  }
+
+  db.prepare('INSERT INTO jsan_disabled_users(user_id,email,reason,disabled_by) VALUES(?,?,?,?)')
+    .run(user.id, user.email, String(req.body?.reason || '').trim().slice(0, 120), req.user.id);
+  console.log(`${user.email} deactivated by ${req.user.email} - seat released, conversations kept`);
+  res.json({ ok: true });
+});
+
+/**
+ * Give the seat back.
+ *
+ * A fresh key is issued rather than the old one restored: the old one was
+ * deleted at the gateway, and the ciphertext this portal holds for it decrypts
+ * to a string that no longer authenticates anything. provisionLiteLLMUser
+ * already knows how to adopt an existing gateway user and retire a stale alias,
+ * which is exactly the state a restored account is in.
+ */
+app.post('/api/admin/users/:id/restore', auth, adminOnly, adminLimiter, async (req, res) => {
+  const user = adminTargetUser(req, res);
+  if (!user) return;
+  if (!disabledRecord(user.id)) return res.status(409).json({ error: 'That account already has a seat' });
+  if (activeUserCount() >= MAX_USERS) {
+    return res.status(409).json({ error: `Every one of the ${MAX_USERS} seats is taken. Deactivate somebody else first.` });
+  }
+
+  let provision;
+  try {
+    provision = await provisionLiteLLMUser({ id: user.litellm_user_id || user.id, name: user.name, email: user.email });
+  } catch (e) {
+    console.error(`Could not reissue a gateway key for ${user.email}:`, e.message);
+    return res.status(502).json({ error: cleanError(e, 'Could not issue them a new gateway key, so the account was left deactivated.') });
+  }
+
+  const encrypted = encryptText(provision.key);
+  transaction(db, () => {
+    db.prepare('UPDATE jsan_users SET litellm_user_id=?,litellm_key_ciphertext=?,litellm_key_iv=?,litellm_key_tag=? WHERE id=?')
+      .run(provision.litellmUserId, encrypted.ciphertext, encrypted.iv, encrypted.tag, user.id);
+    db.prepare('DELETE FROM jsan_disabled_users WHERE user_id=?').run(user.id);
+  });
+  console.log(`${user.email} restored by ${req.user.email} - new gateway key issued`);
+  res.json({ ok: true });
+});
+
+/**
+ * Set a new password with a reset code.
+ *
+ * Public, because the person using it cannot sign in - that is the whole
+ * point - so it is rate limited per network like registration, and the code is
+ * matched by hash exactly as an access code is.
+ *
+ * The address is required beside the code so a code on its own is not enough,
+ * and the two must agree with the same account. A successful reset also clears
+ * the sign-in lockout: somebody who has just proved they hold the code should
+ * not then be told to wait half an hour.
+ */
+app.post('/api/auth/reset-password', resetLimiter, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const code = String(req.body?.code || req.body?.accessCode || '');
+  const password = String(req.body?.password || '');
+  const confirmPassword = String(req.body?.confirmPassword || '');
+
+  const REFUSED = 'That reset code is not valid for this email address';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter the email the reset was issued for' });
+  if (password.length < 10) return res.status(400).json({ error: 'Use at least 10 characters for your new password' });
+  if (confirmPassword !== password) return res.status(400).json({ error: 'The two passwords do not match' });
+
+  const digest = accessCodeDigest(code);
+  if (!digest) return res.status(403).json({ error: REFUSED });
+  const reset = db.prepare('SELECT * FROM jsan_password_resets WHERE code_hash=?').get(digest);
+  if (!reset) return res.status(403).json({ error: REFUSED });
+  if (reset.used_at) return res.status(403).json({ error: 'That reset code has already been used. Ask your JSAN admin for another.' });
+  if (reset.revoked_at) return res.status(403).json({ error: 'That reset code was replaced by a newer one. Use the most recent code you were sent.' });
+  if (Date.parse(reset.expires_at) <= Date.now()) return res.status(403).json({ error: 'That reset code has expired. Ask your JSAN admin for another.' });
+  if (String(reset.email).toLowerCase() !== email) return res.status(403).json({ error: REFUSED });
+
+  const user = getUserById(reset.user_id);
+  if (!user) return res.status(403).json({ error: REFUSED });
+  if (disabledRecord(user.id)) return res.status(403).json({ error: DISABLED_MESSAGE, code: 'account_disabled' });
+
+  // Hashed before the transaction: bcrypt is deliberately slow, and SQLite's
+  // single write lock is held for the whole of a transaction body.
+  const passwordHash = await bcrypt.hash(password, 12);
+  try {
+    transaction(db, () => {
+      // Re-read under the write lock, so two people racing the same code
+      // cannot both spend it.
+      const current = db.prepare('SELECT used_at,revoked_at FROM jsan_password_resets WHERE id=?').get(reset.id);
+      if (!current || current.used_at || current.revoked_at) throw new RegistrationConflict('That reset code has already been used. Ask your JSAN admin for another.');
+      db.prepare('UPDATE jsan_users SET password_hash=? WHERE id=?').run(passwordHash, user.id);
+      db.prepare('UPDATE jsan_password_resets SET used_at=? WHERE id=?').run(nowIso(), reset.id);
+    });
+  } catch (e) {
+    if (e instanceof RegistrationConflict) return res.status(409).json({ error: e.message });
+    console.error('Password reset failed:', e.message);
+    return res.status(500).json({ error: 'Could not set the new password. Nothing was changed - try again.' });
+  }
+
+  clearLoginFailures(email);
+  db.prepare('UPDATE jsan_users SET last_login_at=? WHERE id=?').run(nowIso(), user.id);
+  console.log(`${user.email} set a new password with reset ${reset.code_hint}`);
+  const signedIn = { id: user.id, name: user.name, email: user.email };
+  setSessionCookie(res, createSession(signedIn));
+  res.json({ user: { ...signedIn, isAdmin: isAdmin(signedIn) } });
+});
+
+/**
+ * A developer changes their own password, knowing the current one.
+ *
+ * The reset route above is the assisted path, for somebody who cannot get in at
+ * all; this is the ordinary one. Without it the only way to change a password
+ * you still knew was to ask an admin to issue a reset - which puts a live code
+ * on a chat thread for something that needed no code at all.
+ *
+ * The current password is asked for even though the session already proves who
+ * this is, because a session is what somebody finds at an unlocked desk. The
+ * password is the part they would have to know.
+ *
+ * A change also retires any reset the admin has issued: the developer clearly
+ * did not need it, and leaving it live leaves a spare key to the account.
+ */
+app.post('/api/auth/change-password', auth, passwordChangeLimiter, async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword || '');
+  const password = String(req.body?.password || '');
+  const confirmPassword = String(req.body?.confirmPassword || '');
+
+  if (!currentPassword) return res.status(400).json({ error: 'Enter your current password' });
+  if (password.length < 10) return res.status(400).json({ error: 'Use at least 10 characters for your new password' });
+  if (confirmPassword !== password) return res.status(400).json({ error: 'The two passwords do not match' });
+  if (password === currentPassword) return res.status(400).json({ error: 'That is already your password. Choose a different one.' });
+
+  const user = getUserById(req.user.id);
+  if (!user) return res.status(404).json({ error: 'That account no longer exists' });
+
+  // The same refusal a reset gets, for the same reason: ensureSeedAccounts puts
+  // the configured password back at the next boot, so this would quietly undo
+  // itself. Checked before the current password, so a seeded account is told
+  // why rather than being walked through a form that cannot work.
+  const problem = passwordResetProblem(user);
+  if (problem) return res.status(409).json({ error: problem });
+
+  if (!(await bcrypt.compare(currentPassword, user.password_hash))) {
+    return res.status(403).json({ error: 'That is not your current password' });
+  }
+
+  // Hashed outside the transaction: bcrypt is deliberately slow, and SQLite
+  // holds one write lock for the whole of a transaction body.
+  const passwordHash = await bcrypt.hash(password, 12);
+  try {
+    transaction(db, () => {
+      db.prepare('UPDATE jsan_users SET password_hash=? WHERE id=?').run(passwordHash, user.id);
+      db.prepare(`UPDATE jsan_password_resets SET revoked_at=?
+        WHERE user_id=? AND used_at IS NULL AND revoked_at IS NULL`).run(nowIso(), user.id);
+    });
+  } catch (e) {
+    console.error('Password change failed:', e.message);
+    return res.status(500).json({ error: 'Could not change the password. Nothing was changed - try again.' });
+  }
+
+  // Their own doing, so the failure count that a mistyped password left behind
+  // goes with it. The session cookie is untouched: the JWT carries no password,
+  // and signing somebody out of the tab they just used would read as an error.
+  clearLoginFailures(String(user.email).toLowerCase());
+  console.log(`${user.email} changed their own password`);
+  res.json({ ok: true });
 });
 
 app.post('/api/admin/access-codes/:id/revoke', auth, adminOnly, adminLimiter, (req, res) => {
@@ -1859,7 +2274,12 @@ app.use((req, res, next) => {
 // Run once at boot: idempotent, bounded by the seat cap, and a failure is logged
 // rather than fatal, since text still works without it.
 async function widenKeyScopes() {
-  const users = db.prepare('SELECT id,email,litellm_key_ciphertext,litellm_key_iv,litellm_key_tag FROM jsan_users').all();
+  // Deactivated accounts are skipped: their key was deleted at LiteLLM when the
+  // seat was given up, so widening it would fail on every boot for an account
+  // that is meant to have no access at all.
+  const users = db.prepare(`SELECT u.id,u.email,u.litellm_key_ciphertext,u.litellm_key_iv,u.litellm_key_tag
+    FROM jsan_users u
+    WHERE NOT EXISTS (SELECT 1 FROM jsan_disabled_users d WHERE d.user_id = u.id)`).all();
   if (!users.length) return;
   let updated = 0;
   for (const user of users) {

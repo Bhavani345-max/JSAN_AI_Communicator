@@ -58,7 +58,58 @@ is set, and leaving it unset makes issued codes the only way in.
 
 Three wrong passwords lock that address for 30 minutes; the count lives in the
 database rather than in process memory, so restarting the portal does not hand
-the allowance back.
+the allowance back. An admin can lift a lockout from the Developers list rather
+than leaving somebody to wait it out.
+
+A forgotten password is recovered the same way a seat is granted. The portal
+sends no email — there is no mail service behind it — so a self-service reset
+link would have nowhere to go. Instead the admin issues a reset code from the
+developer's row and passes it on, and the developer sets a new password on the
+sign-in card under **Use a reset code**. The code is bound to one address, works
+once, lapses after a day, and clears any lockout on the way through. Issuing a
+second reset retires the first, so only one is ever live. Seeded accounts are
+refused one: `ensureSeedAccounts` reapplies their configured password at every
+boot, so a reset would quietly undo itself, and the page says so instead.
+
+A password you still know is changed without involving an admin at all: the key
+icon beside the theme toggle asks for the current one and sets a new one. That
+route exists so an ordinary change does not have to become a reset code on a
+chat thread, which is what asking an admin for one amounts to. The current
+password is required even though the session already proves who is asking,
+because a session is what somebody finds at an unlocked desk. A change also
+retires any reset an admin had issued, so nothing is left behind as a spare key.
+
+Deactivating a developer frees their seat and deletes their key at the gateway,
+which are the two things a departure is actually about. Nothing is destroyed:
+the account, its conversations and its messages stay exactly where they are, and
+restoring returns the seat and issues a fresh key. That matters because
+`MAX_USERS` counts seats, not accounts — without a way to give one back, a team
+that has churned through twenty people could never admit a twenty-first. Admin
+accounts are refused: deactivating the account you are signed in as would close
+the Admin page behind you, so the address has to leave `ADMIN_EMAILS` first.
+
+## On a phone
+
+The same page, with a few things deliberately different. The sidebar and the
+conversations list become drawers — opened from the bar across the top, which is
+also the only place the JSAN mark appears at that width, and closed by tapping
+beside them. Enter types a new line instead of sending, because a phone keyboard
+has no Shift to hold and the send button is an inch away; the composer says
+**Tap to send** rather than **Enter to send** so nobody has to guess.
+
+Deleting a conversation asks first. It is worth saying why: the control that
+does it sits inside the row that opens the conversation, and it used to appear
+only on hover — which on a touch screen means invisible, but still perfectly
+tappable. An aimed-at row could delete instead of open, and there is no undo. It
+is now visible, reaches the edge of the row, and asks.
+
+Heights are measured in `dvh` rather than `vh`, so the composer is not left
+underneath Chrome's address bar; the page cannot be pulled down to reload in the
+middle of an answer arriving; and a message typed but not sent warns before
+Android's back gesture leaves the site. The copy buttons fall back to an older
+mechanism when the portal is reached over plain http — the clipboard API does
+not exist outside a secure context, which is exactly the case the first time
+somebody tries the portal from their phone on the office network.
 
 One developer may have two model calls running at once — `/api/chat`,
 `/api/documents` and `/v1` draw on the same allowance, and the third simultaneous

@@ -175,7 +175,74 @@ CREATE INDEX IF NOT EXISTS jsan_access_code_redemptions_code_idx
 CREATE INDEX IF NOT EXISTS jsan_access_code_redemptions_user_idx
   ON jsan_access_code_redemptions(user_id);
 
+-- Password resets an admin hands to one developer.
+--
+-- The portal has no email sender and no route that mails anybody anything, so
+-- a self-service "forgot my password" link has nowhere to send the link to.
+-- Before this table existed that left a forgotten password unrecoverable: the
+-- developer could not reset it and the admin had no way to help, and the only
+-- repair was editing SEED_ACCOUNTS or the database by hand.
+--
+-- So a reset is issued the same way a seat is - the admin generates a code and
+-- passes it to the person however they already talk to them. Held both ways for
+-- the same two reasons jsan_access_codes gives: hashed so a submitted code is
+-- matched in one indexed read, encrypted so the admin can read it back to
+-- somebody who lost the message rather than having to issue a second one.
+--
+-- Bound to a user id as well as an address, so a reset cannot be carried over
+-- to a different account by anyone who learns the code.
+CREATE TABLE IF NOT EXISTS jsan_password_resets (
+  id              TEXT PRIMARY KEY,
+  user_id         TEXT NOT NULL REFERENCES jsan_users(id) ON DELETE CASCADE,
+  email           TEXT NOT NULL COLLATE NOCASE,
+  code_hash       TEXT NOT NULL UNIQUE,
+  code_ciphertext TEXT NOT NULL,
+  code_iv         TEXT NOT NULL,
+  code_tag        TEXT NOT NULL,
+  code_hint       TEXT NOT NULL,
+  -- ISO-8601 UTC. Always set: a reset that never lapses is a spare key.
+  expires_at      TEXT NOT NULL,
+  used_at         TEXT,
+  -- Set when a newer reset supersedes this one, so only one is ever live.
+  revoked_at      TEXT,
+  created_by      TEXT REFERENCES jsan_users(id) ON DELETE SET NULL,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS jsan_password_resets_user_idx
+  ON jsan_password_resets(user_id);
+
+-- Developers who no longer have a seat.
+--
+-- A row here rather than a flag on jsan_users, and a row rather than a DELETE,
+-- for three separate reasons:
+--
+--   Deleting the account would take its conversations and messages with it -
+--   ON DELETE CASCADE reaches all of them - and a developer leaving is not a
+--   reason to destroy the work the team did with them.
+--
+--   The seat has to come back. MAX_USERS counts accounts, so without a way to
+--   give one up, a team that has churned through twenty people can never admit
+--   a twenty-first even with empty desks.
+--
+--   Their gateway key has to stop working, which is the part that matters on
+--   the day somebody leaves. That is done at LiteLLM when this row is written,
+--   and a fresh key is issued if they are ever restored.
+--
+-- Kept as its own table so no existing table has to be altered: every table in
+-- this schema appears through CREATE TABLE IF NOT EXISTS, which means a
+-- database written by an older version of the portal gains this one on the next
+-- boot without a migration step and without touching a byte of what it holds.
+CREATE TABLE IF NOT EXISTS jsan_disabled_users (
+  user_id     TEXT PRIMARY KEY REFERENCES jsan_users(id) ON DELETE CASCADE,
+  -- Denormalised so the record still reads if the account is ever removed.
+  email       TEXT NOT NULL COLLATE NOCASE,
+  reason      TEXT NOT NULL DEFAULT '',
+  disabled_by TEXT REFERENCES jsan_users(id) ON DELETE SET NULL,
+  disabled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+) STRICT;
+
 -- Updated rather than left alone, so a database created before the image table
 -- existed reports the version it has actually been migrated to.
-INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '5')
+INSERT INTO jsan_schema_meta(key, value) VALUES ('schema_version', '6')
   ON CONFLICT(key) DO UPDATE SET value = excluded.value;

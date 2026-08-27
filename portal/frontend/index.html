@@ -2,7 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8"/>
-    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <!-- interactive-widget: when the on-screen keyboard opens, shrink the page
+         rather than leave it full height behind the keyboard. That is what
+         keeps the composer directly above the keys on Android instead of
+         somewhere underneath them. Ignored by browsers that do not know it,
+         and no scale is pinned, so pinch zoom still works. -->
+    <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content"/>
     <meta name="theme-color" content="#ffffff"/>
     <!-- The JSAN mark on a brand-blue tile. All three are generated from one
          description of the geometry by scripts/icons.mjs - run `npm run icons`

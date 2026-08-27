@@ -13,7 +13,10 @@
 - [ ] Portal has `ai.jsanconsulting.com`
 - [ ] Railway TLS active
 - [ ] Strong registration access code, or none at all and codes issued per developer
-- [ ] `ADMIN_EMAILS` set to the accounts that may issue access codes
+- [ ] `ADMIN_EMAILS` set to the accounts that may issue access codes, reset
+      passwords, lift lockouts and free seats
+- [ ] More than one admin address, so a single forgotten password cannot leave
+      the portal with nobody able to administer it
 - [ ] Strong JWT secret
 - [ ] Strong key-encryption secret
 - [ ] LiteLLM master key generated

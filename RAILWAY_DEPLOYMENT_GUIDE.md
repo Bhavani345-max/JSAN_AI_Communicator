@@ -60,9 +60,34 @@ nothing has to be kept in a spreadsheet. Where `REGISTRATION_ACCESS_CODE` is
 still set, that shared code keeps working alongside the issued ones; clear it
 once the team has their own.
 
+The same page is where you deal with an account afterwards: lift a lockout,
+issue a password reset code, or free the seat of somebody who has left.
+Deactivating keeps their conversations and can be undone — it revokes their
+gateway key and gives the seat back to the pool. Note that a seeded account's
+password cannot be reset from there, because `SEED_ACCOUNTS` is reapplied at
+every boot; change it in the variable instead.
+
+### Deploying over a portal that is already running
+
+Nothing has to be done to the database, and nothing has to be taken offline.
+The schema moves from version 5 to version 6, and that upgrade is two new
+tables and the version marker — no column is altered, no row is rewritten, no
+migration step is run. Every table in `schema.sql` is created with `IF NOT
+EXISTS`, so the two new ones simply appear on the next boot and everything
+already in the file is left exactly as it was. Accounts keep their passwords,
+conversations and messages keep their contents, and because `JWT_SECRET` is
+unchanged by a deploy, sessions that were open before it are still open after.
+`node test/migration.mjs` in `portal/backend` is the assertion of all of that:
+it builds a version 5 database with accounts, conversations, messages and an
+attached image in it, opens it with this version, and compares every table
+before and after row by row.
+
 Open `https://ai.jsanconsulting.com`, register the owner/test account with a
 team access code, then verify:
 - login/logout
+- changing your own password from the key icon in the sidebar
+- the portal on a phone: both drawers, sending a message, deleting a
+  conversation
 - conversation persistence
 - Auto / Code / Think / Fast
 - developer key display/rotation
