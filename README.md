@@ -88,14 +88,13 @@ that has churned through twenty people could never admit a twenty-first. Admin
 accounts are refused: deactivating the account you are signed in as would close
 the Admin page behind you, so the address has to leave `ADMIN_EMAILS` first.
 
-## On a phone
-
-The same page, with a few things deliberately different. The sidebar and the
-conversations list become drawers — opened from the bar across the top, which is
-also the only place the JSAN mark appears at that width, and closed by tapping
-beside them. Enter types a new line instead of sending, because a phone keyboard
-has no Shift to hold and the send button is an inch away; the composer says
-**Tap to send** rather than **Enter to send** so nobody has to guess.
+On a phone it is the same page, with a few things deliberately different. The
+sidebar and the conversations list become drawers — opened from the bar across
+the top, which is also the only place the JSAN mark appears at that width, and
+closed by tapping beside them. Enter types a new line instead of sending,
+because a phone keyboard has no Shift to hold and the send button is an inch
+away; the composer says **Tap to send** rather than **Enter to send** so nobody
+has to guess.
 
 Deleting a conversation asks first. It is worth saying why: the control that
 does it sits inside the row that opens the conversation, and it used to appear

@@ -191,6 +191,101 @@ check('deleting a code takes its redemptions with it', () => {
     'a redemption outlived the code it points at');
 });
 
+// ---------------------------------------------------------------------------
+// Password resets and released seats — schema version 6
+// ---------------------------------------------------------------------------
+//
+// Both tables record something *about* an account rather than something the
+// account owns, which is what makes their cascades worth pinning down. A reset
+// must not outlive the developer it would let in, a released seat must not
+// outlive the account it was released from, and neither may take the admin who
+// wrote it down with them when that admin's own account goes.
+//
+// These start from users of their own: by this point the checks above have
+// deleted theirs, which is rather the point of them.
+
+const developerId = crypto.randomUUID();
+const adminId = crypto.randomUUID();
+const resetId = crypto.randomUUID();
+
+const insertReset = (id, hash, options = {}) => db.prepare(
+  `INSERT INTO jsan_password_resets(id,user_id,email,code_hash,code_ciphertext,code_iv,code_tag,code_hint,expires_at,created_by)
+   VALUES(?,?,?,?,?,?,?,?,?,?)`
+).run(
+  id,
+  options.userId ?? developerId,
+  options.email ?? 'kiran@jsanconsulting.com',
+  hash, 'ct', 'iv', 'tag', 'RESET-...-7VQU',
+  'expiresAt' in options ? options.expiresAt : new Date(Date.now() + 86_400_000).toISOString(),
+  'createdBy' in options ? options.createdBy : adminId
+);
+
+check('a password reset can be issued against a developer', () => {
+  insertUser(developerId, 'kiran@jsanconsulting.com');
+  insertUser(adminId, 'admin@jsanconsulting.com');
+  insertReset(resetId, 'reset-hash-one');
+  const row = db.prepare('SELECT * FROM jsan_password_resets WHERE id=?').get(resetId);
+  assert.equal(row.used_at, null, 'a fresh reset was already spent');
+  assert.equal(row.revoked_at, null, 'a fresh reset was already retired');
+  assert.match(row.created_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `got ${row.created_at}`);
+});
+
+check('two resets cannot share a hash', () => {
+  assert.throws(() => insertReset(crypto.randomUUID(), 'reset-hash-one'), /UNIQUE/i);
+});
+
+check('a reset that never lapses is refused', () => {
+  // expires_at is NOT NULL deliberately: a reset with no expiry is a spare key.
+  assert.throws(() => insertReset(crypto.randomUUID(), 'reset-hash-two', { expiresAt: null }), /NOT NULL/i);
+});
+
+check('a reset for a developer who does not exist is refused', () => {
+  assert.throws(() => insertReset(crypto.randomUUID(), 'reset-hash-three', { userId: 'ghost' }), /FOREIGN KEY/i);
+});
+
+check('a reset is matched to its address in any casing', () => {
+  const row = db.prepare('SELECT id FROM jsan_password_resets WHERE code_hash=? AND email=?')
+    .get('reset-hash-one', 'Kiran@JsanConsulting.com');
+  assert.equal(row?.id, resetId);
+});
+
+check('a developer can give up their seat', () => {
+  db.prepare('INSERT INTO jsan_disabled_users(user_id,email,reason,disabled_by) VALUES(?,?,?,?)')
+    .run(developerId, 'kiran@jsanconsulting.com', 'left the team', adminId);
+  const row = db.prepare('SELECT * FROM jsan_disabled_users WHERE user_id=?').get(developerId);
+  assert.equal(row.reason, 'left the team');
+  assert.match(row.disabled_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `got ${row.disabled_at}`);
+});
+
+check('the same seat cannot be given up twice', () => {
+  assert.throws(() => db.prepare('INSERT INTO jsan_disabled_users(user_id,email) VALUES(?,?)')
+    .run(developerId, 'kiran@jsanconsulting.com'), /UNIQUE|PRIMARY KEY/i);
+});
+
+check('a seat cannot be released for a developer who does not exist', () => {
+  assert.throws(() => db.prepare('INSERT INTO jsan_disabled_users(user_id,email) VALUES(?,?)')
+    .run('ghost', 'nobody@jsanconsulting.com'), /FOREIGN KEY/i);
+});
+
+check('a reset and a released seat both outlive the admin behind them', () => {
+  db.prepare('DELETE FROM jsan_users WHERE id=?').run(adminId);
+  const reset = db.prepare('SELECT created_by FROM jsan_password_resets WHERE id=?').get(resetId);
+  assert.ok(reset, 'the reset was deleted with the admin who issued it');
+  assert.equal(reset.created_by, null, 'created_by was not cleared');
+  const released = db.prepare('SELECT disabled_by,email FROM jsan_disabled_users WHERE user_id=?').get(developerId);
+  assert.ok(released, 'the record was deleted with the admin who wrote it');
+  assert.equal(released.disabled_by, null, 'disabled_by was not cleared');
+  assert.equal(released.email, 'kiran@jsanconsulting.com', 'the address was lost');
+});
+
+check('deleting a developer takes their reset and their released seat with them', () => {
+  db.prepare('DELETE FROM jsan_users WHERE id=?').run(developerId);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jsan_password_resets').get().n, 0,
+    'a reset outlived the account it would have let into');
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM jsan_disabled_users').get().n, 0,
+    'a deactivation record outlived the account it was about');
+});
+
 check('the database is still structurally sound', () => assert.deepEqual(checkIntegrity(db), []));
 
 db.close();
