@@ -729,13 +729,6 @@ async function findLiteLLMUserId(email) {
 // unique across every key it holds. Neither is a reason to fail, because what
 // actually grants access is the key, and a new one is issued either way.
 /**
- * One non-streaming call to the gateway, on a developer's own virtual key.
- *
- * /api/chat streams because somebody is watching the answer arrive. The deck
- * planner is not: it waits on a single JSON object and has nothing to show
- * until that object is complete, so it wants the whole reply or an error.
- */
-/**
  * Start a telemetry record from a gateway response's headers.
  *
  * LiteLLM reports what the router did in response headers rather than in the
@@ -801,6 +794,13 @@ function readStreamTelemetry(telemetry, frame) {
   }
 }
 
+/**
+ * One non-streaming call to the gateway, on a developer's own virtual key.
+ *
+ * /api/chat streams because somebody is watching the answer arrive. The deck
+ * planner is not: it waits on a single JSON object and has nothing to show
+ * until that object is complete, so it wants the whole reply or an error.
+ */
 async function callModel({ key, model, messages, user, timeout = 120000 }) {
   const upstream = await fetch(`${LITELLM_BASE_URL}/v1/chat/completions`, {
     method: 'POST',
@@ -2299,10 +2299,12 @@ async function widenKeyScopes() {
 // than raising it, since the rest of the portal works without it and the next
 // boot tries again — which matters because LiteLLM may still be starting.
 //
-// The password is reapplied rather than left alone because this portal has no
-// change-password route: configuration is the only source of truth for these
-// accounts, so agreeing with it is what makes the credentials work on every
-// run instead of only on the one where the row was first written.
+// The password is reapplied rather than left alone because configuration is the
+// only source of truth for these accounts, so agreeing with it is what makes the
+// credentials work on every run instead of only on the one where the row was
+// first written. /api/auth/change-password and the admin reset both refuse a
+// seeded address for that same reason - see passwordResetProblem - so nothing
+// else can be quietly undone here.
 async function ensureSeedAccounts() {
   if (!SEED_ACCOUNTS.length) return;
   let created = 0, restored = 0, failed = 0;

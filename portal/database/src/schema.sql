@@ -1,9 +1,11 @@
 -- JSAN Dev AI — SQLite schema
 --
--- Mirrors the PostgreSQL schema in src/server.js (initDb) so the same
--- application logic works against either engine.
+-- Translated from the PostgreSQL schema the portal ran on before SQLite. That
+-- version, and the initDb that created it, are gone from src/server.js: this
+-- file is now the only definition of the store, applied on every boot by
+-- connect() in sqlite.js.
 --
--- Translation notes:
+-- Translation notes, kept because they explain the column types:
 --   UUID          -> TEXT   (crypto.randomUUID() strings, as the app already generates)
 --   TIMESTAMPTZ   -> TEXT   ISO-8601 UTC, e.g. 2026-08-18T13:56:12.345Z
 --                           Same wire format as JSON.stringify(new Date()), lexically

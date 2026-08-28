@@ -2,7 +2,7 @@
 //
 // The project had no template system to reuse, so these are a small built-in
 // set drawn from the brand tokens already used in the web app (--jsan-blue,
-// --jsan-navy, --jsan-cyan and friends in web/src/styles.css) so a generated
+// --jsan-navy, --jsan-cyan and friends in frontend/src/styles.css) so a generated
 // deck looks like it belongs to the same product. Adding a template is adding
 // one entry here; the picker in the UI is driven by this list.
 
